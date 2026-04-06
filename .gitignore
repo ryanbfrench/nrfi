@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data & Analysis
+data/
+scripts/
+
+# Logs
+logs/
+
+# Model files
+*.keras
+*.h5
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+
+# Claude
+.claude/
