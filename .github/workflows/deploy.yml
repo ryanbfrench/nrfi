@@ -32,6 +32,6 @@ jobs:
         run: |
           zip lambda.zip lambda_function.py
           aws lambda update-function-code \
-            --function-name nrfi-data-collector \
+            --function-name nrfi-daily \
             --zip-file fileb://lambda.zip \
             --query 'FunctionArn' --output text
