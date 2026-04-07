@@ -644,7 +644,8 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
               f'<span style="color:{G}">NRFI</span> {nrfi_odds_s}</td>'
             + '</tr>'
         )
-        return away_row + home_row
+        spacer = f'<tr><td colspan="5" style="padding:4px 0;border:none"></td></tr>'
+        return away_row + home_row + spacer
 
     def games_table(rows_iter, header=True):
         hdr = (f'<tr>{th("Team")}{th("Starter")}'
