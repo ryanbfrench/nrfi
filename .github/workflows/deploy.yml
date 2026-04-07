@@ -6,6 +6,7 @@ on:
     paths:
       - 'daily_picks.py'
       - 'lambda_function.py'
+  workflow_dispatch:
 
 permissions:
   contents: read
