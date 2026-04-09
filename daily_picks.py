@@ -199,29 +199,27 @@ def fetch_odds():
       Over 0.5 = YRFI, Under 0.5 = NRFI. Lines at any other point are ignored
       for NRFI/YRFI odds (a line at 1.5 is a different bet).
 
-    Also fetches alternate_totals_1st_1_innings to detect strong YRFI signals:
-      If any book posts Over >1 at even money or better (American >= -110),
-      the market is pricing 2+ first-inning runs as ~50%+, an extreme YRFI signal.
+    Requests American-format odds directly (same as backfill_odds_2025.py) and
+    saves a raw snapshot to s3://nrfi-store/odds/{year}/{date}.json so historical
+    odds are stored in a consistent format for future analysis.
 
     Returns:
-      odds        — dict: 'AWAY@HOME' -> (nrfi_odds, yrfi_odds) American ints
-      alt_signals — dict: 'AWAY@HOME' -> {'point': float, 'best_over_american': int}
-                    only populated when Over >1 is at >= -110
-    Falls back to Bovada scrape if API key not set (no alt_signals in that case).
+      odds — dict: 'AWAY@HOME' -> (nrfi_odds, yrfi_odds) American ints
+    Falls back to Bovada scrape if API key not set.
     """
     api_key = os.environ.get('ODDS_API_KEY')
     if not api_key:
         return _fetch_odds_bovada_fallback()
 
-    odds        = {}
-    alt_signals = {}
+    odds      = {}
+    raw_events = []   # collect for S3 snapshot
     try:
         events_resp = requests.get(
             'https://api.the-odds-api.com/v4/sports/baseball_mlb/events',
             params={'apiKey': api_key, 'daysFrom': 1}, timeout=15
         )
         if events_resp.status_code != 200:
-            return _fetch_odds_bovada_fallback(), {}
+            return _fetch_odds_bovada_fallback()
         events = events_resp.json()
 
         for event in events:
@@ -235,57 +233,57 @@ def fetch_odds():
             r = requests.get(
                 f'https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{event["id"]}/odds',
                 params={'apiKey': api_key, 'regions': 'us',
-                        'markets': 'totals_1st_1_innings,alternate_totals_1st_1_innings'},
+                        'markets': 'totals_1st_1_innings',
+                        'oddsFormat': 'american'},
                 timeout=15
             )
             if r.status_code != 200:
                 continue
 
+            event_data = r.json()
+            raw_events.append(event_data)   # accumulate for S3
+
             matchup_key = f'{away_abbv}@{home_abbv}'
             best_yrfi = best_nrfi = None
-            # best Over at each point > 0.5: point -> best American odds
-            alt_over: dict[float, int] = {}
 
-            for bk in r.json().get('bookmakers', []):
+            for bk in event_data.get('bookmakers', []):
                 for mkt in bk.get('markets', []):
                     for outcome in mkt.get('outcomes', []):
-                        dec   = outcome.get('price')
-                        point = outcome.get('point')
-                        if dec is None or point is None:
+                        american = outcome.get('price')   # already American int
+                        point    = outcome.get('point')
+                        if american is None or point is None:
                             continue
-                        american = _decimal_to_american(dec)
                         name = outcome['name']
-
                         if point == 0.5:
-                            # Standard NRFI/YRFI line
                             if name == 'Over' and (best_yrfi is None or american > best_yrfi):
                                 best_yrfi = american
                             elif name == 'Under' and (best_nrfi is None or american > best_nrfi):
                                 best_nrfi = american
-                        elif name == 'Over' and point > 0.5:
-                            # Alternate over: track best odds per point
-                            if point not in alt_over or american > alt_over[point]:
-                                alt_over[point] = american
 
             if best_nrfi is not None and best_yrfi is not None:
                 odds[matchup_key] = (best_nrfi, best_yrfi)
-
-            # Flag strong YRFI signal: any Over at point > 1 priced at -110 or better
-            for point, american in alt_over.items():
-                if point > 1.0 and american >= -110:
-                    # Keep the highest point that still clears -110 (most extreme signal)
-                    existing = alt_signals.get(matchup_key)
-                    if existing is None or point > existing['point']:
-                        alt_signals[matchup_key] = {
-                            'point': point,
-                            'best_over_american': american,
-                        }
 
     except Exception as ex:
         print(f'  WARNING: Odds API fetch failed ({ex}) — trying Bovada fallback')
         return _fetch_odds_bovada_fallback()
 
-    return odds, alt_signals
+    # Save raw snapshot to S3 — same path/format as backfill_odds_2025.py
+    # s3://nrfi-store/odds/{year}/{date}.json
+    if raw_events:
+        _odds_s3_key = f'odds/{TODAY.year}/{TODAY.isoformat()}.json'
+        try:
+            import boto3
+            boto3.client('s3').put_object(
+                Bucket='nrfi-store',
+                Key=_odds_s3_key,
+                Body=json.dumps(raw_events, separators=(',', ':')),
+                ContentType='application/json',
+            )
+            print(f'  Odds snapshot saved to s3://nrfi-store/{_odds_s3_key}')
+        except Exception as _ex:
+            print(f'  WARNING: could not save odds snapshot to S3 ({_ex})')
+
+    return odds
 
 
 def _fetch_odds_bovada_fallback():
@@ -422,7 +420,7 @@ def _pl_str(pl):
     return f'<span style="color:{"#34d399" if pl >= 0 else "#f87171"};font-weight:700">{"+" if pl>=0 else ""}${pl:.2f}</span>'
 
 def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
-                     lr_threshold, nn_threshold, cv_acc, cv_cov, alt_signals=None):
+                     lr_threshold, nn_threshold, cv_acc, cv_cov):
     """
     Clean white email:
       - Yesterday's results table
@@ -490,26 +488,28 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                     result_label = 'Pending'; result_color = MUT
             if result_label is None: continue
             actual = ('YRFI' if int(r['actual_yrfi'])==1 else 'NRFI') if pd.notna(r.get('actual_yrfi')) else '—'
-            pred   = r.get('lr_pred','—')
+            pred   = r.get('lr_pred','—') if 'LR' in models_used else r.get('nn_pred','—')
             pred_color = G if pred == 'NRFI' else R
+            nn_first = sorted(models_used, key=lambda x: 0 if x == 'NN' else 1)
+            model_str = ','.join(nn_first)
             nrfi_o = _odds_str(r.get('nrfi_odds')); yrfi_o = _odds_str(r.get('yrfi_odds'))
             pl_str = _pl_str(pl_val) if pl_val is not None else '—'
             rows_html += (
                 f'<tr>'
                 + td(r['matchup'], bold=True)
-                + td('/'.join(models_used), color=MUT)
                 + td(f'<span style="color:{pred_color};font-weight:600">{pred}</span>')
-                + td(f'{r.get("lr_conf",0):.1%}', right=True)
-                + td(f'{nrfi_o} / {yrfi_o}', right=True, color=MUT)
+                + td(model_str, color=MUT)
                 + td(actual)
                 + td(f'<span style="color:{result_color};font-weight:700">{result_label}</span>', right=True)
+                + td(f'{r.get("lr_conf",0):.1%}', right=True)
+                + td(f'{nrfi_o} / {yrfi_o}', right=True, color=MUT)
                 + td(pl_str, right=True)
                 + '</tr>'
             )
         yest_tbl = (
             f'<table style="width:100%;border-collapse:collapse">'
-            f'<tr>{th("Matchup")}{th("Model")}{th("Pick")}{th("Conf",True)}'
-            f'{th("NRFI / YRFI Odds",True)}{th("Actual")}{th("Result",True)}{th("P/L",True)}</tr>'
+            f'<tr>{th("Matchup")}{th("Pick")}{th("Model")}{th("Actual")}'
+            f'{th("Result",True)}{th("Conf",True)}{th("NRFI / YRFI Odds",True)}{th("P/L",True)}</tr>'
             + rows_html
             + f'<tr><td colspan="7" style="padding:6px 10px;font-size:12px;color:{MUT}">Total</td>'
             + td(_pl_str(total_pl), right=True) + '</tr></table>'
@@ -558,26 +558,6 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
     else:
         ytd_section = ''
 
-    # ── Alt signals — compact single line per game ────────────────────────────
-    if alt_signals:
-        parts = []
-        for matchup, sig in sorted(alt_signals.items()):
-            am = sig['best_over_american']
-            am_str = f'+{am}' if am>=0 else str(am)
-            parts.append(
-                f'<span style="margin-right:18px;white-space:nowrap">'
-                f'<b>{matchup}</b> Over {sig["point"]} '
-                f'<span style="color:#b45309;font-weight:700">{am_str}</span></span>'
-            )
-        alt_signals_section = section(
-            'Market YRFI Signals (Over 1.5 at near-even money)',
-            f'<div style="font-size:13px;color:{TXT};line-height:2">{"".join(parts)}</div>'
-            f'<div style="font-size:11px;color:{MUT};margin-top:6px">'
-            f'Book pricing 1.5+ first-inning runs at ~50%+ implied. Independent YRFI signal.</div>'
-        )
-    else:
-        alt_signals_section = ''
-
     # ── Helper: format pitcher name as "F. Last" ──────────────────────────────
     def fmt_pitcher(name):
         if not name or str(name).strip() in ('', 'TBD', 'nan', 'None'):
@@ -587,68 +567,56 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             return parts[0]
         return f'{parts[0][0]}. {" ".join(parts[1:])}'
 
-    # ── Helper: build a 2-row game block (away row + home row) ────────────────
+    # ── Helper: build a single-row game block ────────────────────────────────
     def game_rows(r, picked=False, pick_info=None):
         """
-        Two <tr> rows per game — away on top, home below.
-        Columns: Team | Pitcher | NN % | LR % | Odds
-        pick_info: dict with keys model_badge, lr_ev, nn_ev (for picked games only)
+        One <tr> per game.
+        Columns: Matchup | Pick | Model | Starter | NN YRFI% | LR YRFI% | Odds
+        pick_info: dict with keys model_str, pick (for picked games only)
         """
-        away, home = r['matchup'].split('@', 1)
+        matchup = r['matchup']
         lrc  = G if r['lr_pred'] == 'NRFI' else R
         nnc  = G if r['nn_pred'] == 'NRFI' else R
         lrfw = '700' if r['lr_confident'] else '400'
         nnfw = '700' if r['nn_confident'] else '400'
 
-        bo = get_odds(r['matchup'])
+        bo = get_odds(matchup)
         yrfi_odds_s = _odds_str(bo[1]) if bo else '—'
         nrfi_odds_s = _odds_str(bo[0]) if bo else '—'
+        odds_cell = (f'<span style="color:{G}">NRFI</span> {nrfi_odds_s}'
+                     f' / <span style="color:{R}">YRFI</span> {yrfi_odds_s}')
 
         a_pitcher = fmt_pitcher(r.get('away_pitcher', ''))
         h_pitcher = fmt_pitcher(r.get('home_pitcher', ''))
+        starter_str = f'{a_pitcher} / {h_pitcher}'
 
-        # model badge for picked games
         if picked and pick_info:
-            badge = pick_info.get('badge', '')
-            badge_html = (f'&nbsp;<span style="font-size:10px;background:#f3f4f6;'
-                          f'padding:1px 5px;border-radius:3px;font-weight:700;'
-                          f'color:#374151">{badge}</span>') if badge else ''
+            pick      = pick_info.get('pick', '—')
+            model_str = pick_info.get('model_str', '—')
+            pick_col  = G if pick == 'NRFI' else R
+            pick_html = f'<span style="color:{pick_col};font-weight:700">{pick}</span>'
         else:
-            badge_html = ''
+            pick_html = f'<span style="color:{MUT}">—</span>'
+            model_str = '—'
 
-        # away row — YRFI side (top of scoreboard)
-        away_row = (
-            f'<tr>'
-            + td(f'<span style="font-weight:{"700" if picked else "400"}">{away}</span>{badge_html}')
-            + td(f'<span style="color:{MUT};font-style:italic;font-size:12px">{a_pitcher}</span>')
+        return (
+            f'<tr style="border-bottom:1px solid {BDR}">'
+            + td(f'<span style="font-weight:{"700" if picked else "400"}">{matchup}</span>')
+            + td(pick_html)
+            + td(model_str, color=MUT)
+            + td(f'<span style="color:{MUT};font-style:italic;font-size:12px">{starter_str}</span>')
             + td(f'<span style="color:{nnc};font-weight:{nnfw}">{r["nn_prob_yrfi"]:.0%}</span>',
                  right=True)
             + td(f'<span style="color:{lrc};font-weight:{lrfw}">{r["lr_prob_yrfi"]:.0%}</span>',
                  right=True)
-            + f'<td style="padding:7px 10px 2px 10px;text-align:right;font-size:12px;'
-              f'color:{MUT};white-space:nowrap;border-bottom:none">'
-              f'<span style="color:{R}">YRFI</span> {yrfi_odds_s}</td>'
+            + f'<td style="padding:7px 10px;text-align:right;font-size:12px;'
+              f'color:{MUT};white-space:nowrap;border-bottom:1px solid {BDR}">'
+              f'{odds_cell}</td>'
             + '</tr>'
         )
-        # home row — NRFI side (bottom of scoreboard), with bottom border
-        home_row = (
-            f'<tr style="border-bottom:2px solid {BDR}">'
-            + td(f'<span style="color:{MUT}">{home}</span>')
-            + td(f'<span style="color:{MUT};font-style:italic;font-size:12px">{h_pitcher}</span>')
-            + td(f'<span style="color:{MUT};font-size:12px">{r["nn_prob_nrfi"]:.0%}</span>',
-                 right=True)
-            + td(f'<span style="color:{MUT};font-size:12px">{r["lr_prob_nrfi"]:.0%}</span>',
-                 right=True)
-            + f'<td style="padding:2px 10px 7px 10px;text-align:right;font-size:12px;'
-              f'color:{MUT};white-space:nowrap;border-bottom:2px solid {BDR}">'
-              f'<span style="color:{G}">NRFI</span> {nrfi_odds_s}</td>'
-            + '</tr>'
-        )
-        spacer = f'<tr><td colspan="5" style="padding:4px 0;border:none"></td></tr>'
-        return away_row + home_row + spacer
 
     def games_table(rows_iter, header=True):
-        hdr = (f'<tr>{th("Team")}{th("Starter")}'
+        hdr = (f'<tr>{th("Matchup")}{th("Pick")}{th("Model")}{th("Starter")}'
                f'{th("NN YRFI%", True)}{th("LR YRFI%", True)}{th("Odds", True)}</tr>'
                ) if header else ''
         return (f'<table style="width:100%;border-collapse:collapse">'
@@ -656,20 +624,20 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 
     # ── Build picked-matchup lookup from picks_rows ───────────────────────────
     # picks_rows may have LR + NN entries for same matchup
-    pick_meta = {}  # matchup -> {badge, lr_ev, nn_ev}
+    pick_meta = {}  # matchup -> {model_str, pick}
     for p in picks_rows:
         m = p['matchup']
         if m not in pick_meta:
-            pick_meta[m] = {'badge': '', 'models': []}
+            pick_meta[m] = {'models': [], 'pick': p.get('prediction', '—')}
         pick_meta[m]['models'].append(p.get('model', ''))
     for m, info in pick_meta.items():
         models = info['models']
-        if 'LR' in models and 'NN' in models:
-            info['badge'] = 'CON'
-        elif 'LR' in models:
-            info['badge'] = 'LR'
+        if 'NN' in models and 'LR' in models:
+            info['model_str'] = 'NN,LR'
+        elif 'NN' in models:
+            info['model_str'] = 'NN'
         else:
-            info['badge'] = 'NN'
+            info['model_str'] = 'LR'
 
     # ── Split today_df_all into picked vs not-picked ──────────────────────────
     if today_df_all is not None and not today_df_all.empty:
@@ -729,7 +697,6 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 
   {yest_section}
   {ytd_section}
-  {alt_signals_section}
   {picks_section}
   {not_picked_section}
 
@@ -1012,31 +979,44 @@ if uses_s3 and _s3_model_exists(NN_MODEL_PATH):
         nn = None
 
 if nn is not None:
-    # Incremental train: 5 epochs on yesterday's S3 batch
-    yesterday_path = (f's3://nrfi-store/data/{YESTERDAY.year}/'
-                      f'{YESTERDAY.month}/{YESTERDAY.day}.txt')
-    try:
-        batch_df = load_data(yesterday_path)
-        for col in ['away_pitcher_ra', 'home_pitcher_ra', 'away_whip', 'home_whip',
-                    'home_yrfi_pct', 'away_yrfi_pct']:
-            batch_df[col] = batch_df[col].replace(0, df[col].median())
-            batch_df[col] = batch_df[col].fillna(df[col].median())
-        feat_batch = make_features(batch_df)
-        # drop rows with any NaN features to prevent weight explosion
-        valid_mask = feat_batch.notna().all(axis=1)
-        feat_batch = feat_batch[valid_mask]
-        y_batch = batch_df['YRFI'].values[valid_mask]
-        if len(feat_batch) == 0:
-            print(f'  WARNING: batch has no clean rows after NaN drop — skipping increment')
-        else:
-            X_batch = nn_scaler.transform(feat_batch.values)
-            nn.fit(X_batch, y_batch, epochs=5, batch_size=64, verbose=0)
-            print(f'  Incremental train: 5 epochs on {len(feat_batch)} games from {YESTERDAY}')
-    except Exception as ex:
-        print(f'  WARNING: could not load yesterday batch ({ex}) — skipping increment')
+    _NN_SEASON_START = date(TODAY.year, 5, 1)
+    if YESTERDAY < _NN_SEASON_START:
+        # Early-season freeze: pitcher RA and YRFI splits are unreliable before May 1
+        # (tiny sample sizes create extreme feature values that are OOD vs training data).
+        # Also, the lambda saves RA as R/G vs training R/IP — wrong scale before this is resolved.
+        # Skip the increment entirely; save model unchanged so weights don't drift.
+        print(f'  Skipping incremental NN update: {YESTERDAY} is pre-May-1 (early-season OOD window)')
+        _save_nn_to_s3(nn, NN_MODEL_PATH)
+        print(f'  NN saved to {NN_MODEL_PATH} (unchanged)')
+    else:
+        # Incremental train: 5 epochs on yesterday's S3 batch
+        yesterday_path = (f's3://nrfi-store/data/{YESTERDAY.year}/'
+                          f'{YESTERDAY.month}/{YESTERDAY.day}.txt')
+        try:
+            batch_df = load_data(yesterday_path)
+            for col in ['away_pitcher_ra', 'home_pitcher_ra', 'away_whip', 'home_whip',
+                        'home_yrfi_pct', 'away_yrfi_pct']:
+                batch_df[col] = batch_df[col].replace(0, df[col].median())
+                batch_df[col] = batch_df[col].fillna(df[col].median())
+            # Apply same preprocessing as training data (RA cap, whip cap)
+            for col in ['away_pitcher_ra', 'home_pitcher_ra']:
+                batch_df[col] = batch_df[col].clip(upper=RA_CAP)
+            feat_batch = make_features(batch_df)
+            # drop rows with any NaN features to prevent weight explosion
+            valid_mask = feat_batch.notna().all(axis=1)
+            feat_batch = feat_batch[valid_mask]
+            y_batch = batch_df['YRFI'].values[valid_mask]
+            if len(feat_batch) == 0:
+                print(f'  WARNING: batch has no clean rows after NaN drop — skipping increment')
+            else:
+                X_batch = nn_scaler.transform(feat_batch.values)
+                nn.fit(X_batch, y_batch, epochs=5, batch_size=64, verbose=0)
+                print(f'  Incremental train: 5 epochs on {len(feat_batch)} games from {YESTERDAY}')
+        except Exception as ex:
+            print(f'  WARNING: could not load yesterday batch ({ex}) — skipping increment')
 
-    _save_nn_to_s3(nn, NN_MODEL_PATH)
-    print(f'  NN saved to {NN_MODEL_PATH}')
+        _save_nn_to_s3(nn, NN_MODEL_PATH)
+        print(f'  NN saved to {NN_MODEL_PATH}')
 else:
     print('\nNo saved NN found — training from scratch on full dataset...')
     nn = _build_nn(X_nn_all.shape[1])
@@ -1209,16 +1189,19 @@ except Exception as ex:
     print(f'  WARNING: prior-year teamrankings fetch failed ({ex})')
 
 def get_yrfi(abbv, split_curr, split_prev, overall, fallback=LEAGUE_YRFI):
-    """current split → prior-year split → overall year rate → league average."""
-    v = split_curr.get(abbv)
-    if v is not None:
-        return v
-    v = split_prev.get(abbv)
-    if v is not None:
-        return v
-    v = overall.get(abbv)
-    if v is not None:
-        return v
+    """
+    Before May 1: prior-year split → current split → overall → league average.
+      Current-year home/away splits are based on ~6 games before May; those tiny
+      samples produce extreme values (0-100%) that land 4-9 std deviations outside
+      the training distribution, making both models overconfident.
+    After May 1: current split → prior-year split → overall → league average.
+    """
+    use_prior_first = TODAY < date(TODAY.year, 5, 1)
+    ordered = [split_prev, split_curr, overall] if use_prior_first else [split_curr, split_prev, overall]
+    for src in ordered:
+        v = src.get(abbv)
+        if v is not None:
+            return v
     return fallback
 
 # ── 4b. Pitcher + team stats (MLB Stats API — 30/60-day rolling windows) ─────
@@ -1316,7 +1299,8 @@ LEAGUE_WHIP = df['home_whip'].median()
 LEAGUE_OPS  = df['home_ops'].median()
 
 def get_pitcher_ra(name):
-    return PITCHER_RA.get(unidecode(name), LEAGUE_RA)
+    # Cap at RA_CAP to match training-data preprocessing (clip(upper=RA_CAP) at line ~859)
+    return min(PITCHER_RA.get(unidecode(name), LEAGUE_RA), RA_CAP)
 
 def get_pitcher_whip(name):
     return PITCHER_WHIP.get(unidecode(name), LEAGUE_WHIP)
@@ -1401,17 +1385,12 @@ print(f'  Fetched weather for {live_count}/{len(WEATHER_CACHE)} stadiums')
 
 # ── 4d. Odds (BettingPros) ────────────────────────────────────────────────────
 print('Fetching odds (The Odds API / Bovada fallback)...')
-GAME_ODDS, ALT_YRFI_SIGNALS = fetch_odds()
+GAME_ODDS = fetch_odds()
 using_real_odds = bool(GAME_ODDS)
 if using_real_odds:
     print(f'  Loaded odds for {len(GAME_ODDS)} games')
 else:
     print(f'  WARNING: No odds available — EV will not be computed')
-if ALT_YRFI_SIGNALS:
-    for mk, sig in ALT_YRFI_SIGNALS.items():
-        am = sig['best_over_american']
-        print(f'  *** STRONG YRFI SIGNAL: {mk}  Over {sig["point"]} at '
-              f'{"+" if am>=0 else ""}{am} (market pricing {sig["point"]}+ runs at ~50%+)')
 
 def get_odds(matchup_key):
     return GAME_ODDS.get(matchup_key)  # None if not available
@@ -1729,6 +1708,5 @@ email_html = build_email_html(
     nn_threshold=nn_high,
     cv_acc=best[1] if best else 0.0,
     cv_cov=best[3] if best else 0.0,
-    alt_signals=ALT_YRFI_SIGNALS,
 )
 send_email(email_html, email_subject, str(TODAY))
