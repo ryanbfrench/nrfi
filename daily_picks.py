@@ -335,7 +335,7 @@ def _fetch_odds_bovada_fallback():
                             odds[f'{away_abbv}@{home_abbv}'] = (nrfi_odds, yrfi_odds)
     except Exception:
         pass
-    return odds, {}
+    return odds
 
 # ── Output delivery (SNS + S3 JSON) ──────────────────────────────────────────
 def deliver_picks(picks_rows, date_str, threshold, cv_acc, cv_cov):
@@ -417,7 +417,7 @@ def _pick_pl(correct, pred, nrfi_odds, yrfi_odds):
 
 def _pl_str(pl):
     if pl is None: return '—'
-    return f'<span style="color:{"#34d399" if pl >= 0 else "#f87171"};font-weight:700">{"+" if pl>=0 else ""}${pl:.2f}</span>'
+    return f'<span style="color:{"#16a34a" if pl >= 0 else "#dc2626"};font-weight:700">{"+" if pl>=0 else ""}${pl:.2f}</span>'
 
 def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                      lr_threshold, nn_threshold, cv_acc, cv_cov):
@@ -429,8 +429,10 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
       - All-games table
     """
     # colour palette — clean light theme
-    G = '#2563eb'   # blue   (NRFI)
-    R = '#7c3aed'   # purple (YRFI)
+    G    = '#2563eb'   # blue   (NRFI predictions)
+    R    = '#7c3aed'   # purple (YRFI predictions)
+    WIN  = '#16a34a'   # green  (wins)
+    LOSS = '#dc2626'   # red    (losses)
     MUT = '#6b7280' # muted grey
     BDR = '#e5e7eb' # border/divider
     TXT = '#111827' # near-black
@@ -462,7 +464,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             if ev_units is None or (isinstance(ev_units, float) and np.isnan(ev_units)):
                 return '—'
             sign = '+' if ev_units >= 0 else ''
-            col  = G if ev_units >= 0 else R
+            col  = WIN if ev_units >= 0 else LOSS
             return f'<span style="color:{col}">{sign}{ev_units:.3f}u (${ev_dollars:+.2f})</span>'
         except Exception:
             return '—'
@@ -483,9 +485,9 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                     pl_val = _pick_pl(correct, r[pred_col], r.get('nrfi_odds'), r.get('yrfi_odds'))
                     if pl_val is not None: total_pl += pl_val
                     result_label = 'WIN' if int(correct) == 1 else 'LOSS'
-                    result_color = G if int(correct) == 1 else R
+                    result_color = WIN if int(correct) == 1 else LOSS
                 else:
-                    result_label = 'Pending'; result_color = MUT
+                    result_label = 'Pending'; result_color = MUT  # pending stays grey
             if result_label is None: continue
             actual = ('YRFI' if int(r['actual_yrfi'])==1 else 'NRFI') if pd.notna(r.get('actual_yrfi')) else '—'
             pred   = r.get('lr_pred','—') if 'LR' in models_used else r.get('nn_pred','—')
@@ -494,13 +496,14 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             model_str = ','.join(nn_first)
             nrfi_o = _odds_str(r.get('nrfi_odds')); yrfi_o = _odds_str(r.get('yrfi_odds'))
             pl_str = _pl_str(pl_val) if pl_val is not None else '—'
+            matchup_disp = r['matchup'].replace('Athletics', 'ATH')
             rows_html += (
                 f'<tr>'
-                + td(r['matchup'], bold=True)
+                + td(matchup_disp, bold=True)
+                + td(f'<span style="color:{result_color};font-weight:700">{result_label}</span>')
                 + td(f'<span style="color:{pred_color};font-weight:600">{pred}</span>')
                 + td(model_str, color=MUT)
                 + td(actual)
-                + td(f'<span style="color:{result_color};font-weight:700">{result_label}</span>', right=True)
                 + td(f'{r.get("lr_conf",0):.1%}', right=True)
                 + td(f'{nrfi_o} / {yrfi_o}', right=True, color=MUT)
                 + td(pl_str, right=True)
@@ -508,8 +511,8 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             )
         yest_tbl = (
             f'<table style="width:100%;border-collapse:collapse">'
-            f'<tr>{th("Matchup")}{th("Pick")}{th("Model")}{th("Actual")}'
-            f'{th("Result",True)}{th("Conf",True)}{th("NRFI / YRFI Odds",True)}{th("P/L",True)}</tr>'
+            f'<tr>{th("Matchup")}{th("Result")}{th("Pick")}{th("Model")}{th("Actual")}'
+            f'{th("Conf",True)}{th("NRFI / YRFI Odds",True)}{th("P/L",True)}</tr>'
             + rows_html
             + f'<tr><td colspan="7" style="padding:6px 10px;font-size:12px;color:{MUT}">Total</td>'
             + td(_pl_str(total_pl), right=True) + '</tr></table>'
@@ -538,8 +541,8 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             pct = w/(w+l)
             pl_sum = sum(_pick_pl(r[correct_col],r[pred_col],r.get('nrfi_odds'),r.get('yrfi_odds'))
                          for _,r in subset.iterrows() if pd.notna(r[correct_col]))
-            pl_col = G if pl_sum>=0 else R
-            acc_col = G if pct>0.5 else R if pct<0.5 else MUT
+            pl_col = WIN if pl_sum>=0 else LOSS
+            acc_col = WIN if pct>0.5 else LOSS if pct<0.5 else MUT
             return (f'<tr>'
                     + td(label, bold=True)
                     + td(f'{w}-{l}')
@@ -574,7 +577,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
         Columns: Matchup | Pick | Model | Starter | NN YRFI% | LR YRFI% | Odds
         pick_info: dict with keys model_str, pick (for picked games only)
         """
-        matchup = r['matchup']
+        matchup = r['matchup'].replace('Athletics', 'ATH')
         lrc  = G if r['lr_pred'] == 'NRFI' else R
         nnc  = G if r['nn_pred'] == 'NRFI' else R
         lrfw = '700' if r['lr_confident'] else '400'
@@ -588,7 +591,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 
         a_pitcher = fmt_pitcher(r.get('away_pitcher', ''))
         h_pitcher = fmt_pitcher(r.get('home_pitcher', ''))
-        starter_str = f'{a_pitcher} / {h_pitcher}'
+        starter_str = f'{a_pitcher} v. {h_pitcher}'
 
         if picked and pick_info:
             pick      = pick_info.get('pick', '—')
@@ -686,13 +689,9 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 <div style="max-width:680px;margin:0 auto;padding:28px 20px">
 
   <!-- Header -->
-  <div style="border-bottom:3px solid {TXT};padding-bottom:14px;margin-bottom:28px">
+  <div style="padding-bottom:14px;margin-bottom:28px">
     <div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:{MUT}">NRFI Daily</div>
     <div style="font-size:26px;font-weight:800;margin-top:4px">{TODAY.strftime('%A, %B')} {TODAY.day}</div>
-    <div style="font-size:13px;color:{MUT};margin-top:6px">
-      {n_games} games &nbsp;&nbsp;|&nbsp;&nbsp; threshold &lt;{round(1-lr_threshold,3)} / &gt;{round(lr_threshold,3)}
-      &nbsp;&nbsp;|&nbsp;&nbsp; CV {cv_acc:.1%} acc &nbsp; {cv_cov:.1%} cov
-    </div>
   </div>
 
   {yest_section}
@@ -702,8 +701,8 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 
   <div style="margin-top:32px;padding-top:12px;border-top:1px solid {BDR};
               font-size:11px;color:{MUT};text-align:center">
-    Generated {datetime.utcnow().strftime('%H:%M UTC')} &nbsp;&middot;&nbsp;
-    LR daily retrain + NN incremental &nbsp;&middot;&nbsp; 1u = ${UNIT}
+    {(lambda u=datetime.utcnow(): f"Generated {(u + timedelta(hours=(-4 if 3 <= u.month <= 10 else -5))).strftime('%H:%M')} {'EDT' if 3 <= u.month <= 10 else 'EST'}")()}
+    &nbsp;&middot;&nbsp; 1u = ${UNIT}
   </div>
 </div>
 </body></html>"""
@@ -940,11 +939,14 @@ def _load_nn_from_s3(s3_path):
         return tf.keras.models.load_model(f.name)
 
 def _save_nn_to_s3(model, s3_path):
-    import boto3
-    bucket, key = s3_path[5:].split('/', 1)
-    with tempfile.NamedTemporaryFile(suffix='.keras', delete=False) as f:
-        model.save(f.name)
-        boto3.client('s3').upload_file(f.name, bucket, key)
+    try:
+        import boto3
+        bucket, key = s3_path[5:].split('/', 1)
+        with tempfile.NamedTemporaryFile(suffix='.keras', delete=False) as f:
+            model.save(f.name)
+            boto3.client('s3').upload_file(f.name, bucket, key)
+    except Exception as ex:
+        print(f'  WARNING: could not save NN to S3 ({ex})')
 
 def _build_nn(input_dim):
     """Best architecture from hyperparam gridsearch (Apr 2026): 8->8->8->1, dropout=0.1, lr=0.005, bs=64, l2=0.001.
@@ -1672,6 +1674,26 @@ save_game_log(
     best[1] if best else 0.0,
     best[3] if best else 0.0,
 )
+
+# ── Load today's game log + picks from S3 if available ───────────────────────
+# Prefer SageMaker's run (authoritative lineups/features) over local recompute
+try:
+    import boto3, io as _io
+    _s3 = boto3.client('s3')
+    _gl_key = f'game_log/{TODAY.year}/{TODAY.isoformat()}.csv'
+    _gl_obj = _s3.get_object(Bucket='nrfi-store', Key=_gl_key)
+    today_df = pd.read_csv(_io.BytesIO(_gl_obj['Body'].read()))
+    print(f'  Loaded today\'s game log from S3 ({len(today_df)} games)')
+    # Also load picks JSON so picks_payload reflects SageMaker's picks
+    _pk_key = f'picks/{TODAY.year}/{TODAY.isoformat()}.json'
+    try:
+        _pk_obj = _s3.get_object(Bucket='nrfi-store', Key=_pk_key)
+        picks_payload = json.loads(_pk_obj['Body'].read()).get('picks', picks_payload)
+        print(f'  Loaded {len(picks_payload)} picks from S3')
+    except Exception:
+        pass  # keep locally computed picks_payload
+except Exception as _ex:
+    print(f'  Using locally computed game data (S3 unavailable: {_ex})')
 
 # ── SES email notification ────────────────────────────────────────────────────
 # Build email subject — include yesterday's record if available
