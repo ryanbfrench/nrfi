@@ -37,6 +37,27 @@ import warnings
 warnings.filterwarnings('ignore')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 
+# ── Utils (structured logging, P/L calc, email chart) ────────────────────────
+try:
+    from utils.logger import log as _log, metric as cw_metric
+    from utils.pl_calc import compute_pl
+    from utils.email_charts import build_threshold_timeline
+except ImportError:
+    def _log(level, msg, **ctx): print(f'[{level}] {msg}')
+    def cw_metric(*args, **kwargs): pass
+    def compute_pl(correct, pred, nrfi_odds, yrfi_odds, unit=10):
+        """Fallback: no P/L without real odds."""
+        if correct is None or (isinstance(correct, float) and __import__('math').isnan(correct)):
+            return None
+        raw = nrfi_odds if pred == 'NRFI' else yrfi_odds
+        if raw is None or (isinstance(raw, float) and __import__('math').isnan(raw)):
+            return None
+        odds = int(raw)
+        if int(correct) == 1:
+            return round(unit * (100 / abs(odds) if odds < 0 else odds / 100), 2)
+        return -float(unit)
+    def build_threshold_timeline(*args, **kwargs): return None
+
 # Inject AWS credentials from CLI (handles SSO/Identity Center; no-op in SageMaker)
 try:
     _raw = subprocess.check_output(
@@ -65,6 +86,7 @@ AFTERNOON_CUTOFF_UTC_HOUR = 21
 MIN_COVERAGE       = 0.10
 MAX_COVERAGE       = 0.25
 UNIT               = 10    # dollars per unit
+HIST_ODDS_API_KEY  = os.environ.get('HISTORICAL_ODDS_API_KEY')
 RECENCY_HALF_LIFE  = 365   # days; games 1yr old carry ~37% weight, 2yr ~14%, 3yr ~5%
 
 # Park factors (2025 — update at start of each season)
@@ -405,16 +427,6 @@ def _ev_str(units, dollars):
     sign = '+' if units >= 0 else ''
     return f'{sign}{units:.3f}u (${sign}{dollars:.2f})'
 
-def _pick_pl(correct, pred, nrfi_odds, yrfi_odds):
-    """Actual P/L for one graded bet. Uses real odds when available, -110 fallback."""
-    if correct is None or pd.isna(correct):
-        return None
-    raw = nrfi_odds if pred == 'NRFI' else yrfi_odds
-    odds = int(raw) if raw is not None and not pd.isna(raw) else -110
-    if int(correct) == 1:
-        return round(UNIT * (100 / abs(odds) if odds < 0 else odds / 100), 2)
-    return -float(UNIT)
-
 def _pl_str(pl):
     if pl is None: return '—'
     return f'<span style="color:{"#16a34a" if pl >= 0 else "#dc2626"};font-weight:700">{"+" if pl>=0 else ""}${pl:.2f}</span>'
@@ -482,7 +494,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                 models_used.append(m)
                 correct = r[correct_col]
                 if pd.notna(correct):
-                    pl_val = _pick_pl(correct, r[pred_col], r.get('nrfi_odds'), r.get('yrfi_odds'))
+                    pl_val = compute_pl(correct, r[pred_col], r.get('nrfi_odds'), r.get('yrfi_odds'))
                     if pl_val is not None: total_pl += pl_val
                     result_label = 'WIN' if int(correct) == 1 else 'LOSS'
                     result_color = WIN if int(correct) == 1 else LOSS
@@ -517,9 +529,11 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             + f'<tr><td colspan="7" style="padding:6px 10px;font-size:12px;color:{MUT}">Total</td>'
             + td(_pl_str(total_pl), right=True) + '</tr></table>'
         )
+        _n_pending = sum(1 for _,r in conf.iterrows() if pd.isna(r.get('nrfi_odds')))
         odds_note = (f'<div style="font-size:11px;color:{MUT};margin-top:8px">'
-                     f'* P/L uses actual odds when available, -110 otherwise</div>'
-                     if any(pd.isna(r.get('nrfi_odds')) for _,r in conf.iterrows()) else '')
+                     f'* {_n_pending} pick{"s" if _n_pending!=1 else ""} missing odds — '
+                     f'P/L excluded until backfilled</div>'
+                     if _n_pending else '')
         yest_section = section(
             f"Yesterday's Results &mdash; {YESTERDAY.strftime('%B')} {YESTERDAY.day}",
             yest_tbl + odds_note
@@ -539,16 +553,24 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                 return f'<tr>{td(label,bold=True)}{td("0-0")}{td("—")}{td("—")}{td("—")}</tr>'
             w = int(subset[correct_col].sum()); l = len(subset)-w
             pct = w/(w+l)
-            pl_sum = sum(_pick_pl(r[correct_col],r[pred_col],r.get('nrfi_odds'),r.get('yrfi_odds'))
-                         for _,r in subset.iterrows() if pd.notna(r[correct_col]))
-            pl_col = WIN if pl_sum>=0 else LOSS
-            acc_col = WIN if pct>0.5 else LOSS if pct<0.5 else MUT
+            pl_vals = [
+                compute_pl(r[correct_col], r[pred_col], r.get('nrfi_odds'), r.get('yrfi_odds'))
+                for _, r in subset.iterrows() if pd.notna(r[correct_col])
+            ]
+            graded_pl = [v for v in pl_vals if v is not None]
+            pending   = len(pl_vals) - len(graded_pl)
+            pl_sum    = sum(graded_pl) if graded_pl else 0.0
+            pl_col  = WIN if pl_sum >= 0 else LOSS
+            acc_col = WIN if pct > 0.5 else LOSS if pct < 0.5 else MUT
+            pl_disp = f'<span style="color:{pl_col};font-weight:600">{"+" if pl_sum>=0 else ""}${pl_sum:.2f}</span>'
+            if pending:
+                pl_disp += f'<span style="color:{MUT};font-size:11px"> ({pending} pending)</span>'
             return (f'<tr>'
                     + td(label, bold=True)
                     + td(f'{w}-{l}')
                     + td(f'<span style="color:{acc_col};font-weight:600">{pct:.1%}</span>', right=True)
                     + td(f'{len(subset)/max(len(ytd_df),1):.1%}', right=True, color=MUT)
-                    + td(f'<span style="color:{pl_col};font-weight:600">{"+" if pl_sum>=0 else ""}${pl_sum:.2f}</span>', right=True)
+                    + td(pl_disp, right=True)
                     + '</tr>')
 
         ytd_tbl = (f'<table style="width:100%;border-collapse:collapse">'
@@ -696,6 +718,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 
   {yest_section}
   {ytd_section}
+  <!-- THRESHOLD_CHART_PLACEHOLDER -->
   {picks_section}
   {not_picked_section}
 
@@ -709,9 +732,13 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
     return body
 
 
-def send_email(html_body, subject, date_str):
+def send_email(html_body, subject, date_str, chart_bytes=None):
     """
     Send daily picks email via AWS SES.
+
+    When chart_bytes is provided, sends MIME multipart/related with the chart
+    embedded as an inline CID image (replaces <!-- THRESHOLD_CHART_PLACEHOLDER -->).
+    Falls back to plain HTML SES send when chart_bytes is None.
 
     Recipients: NRFI_SES_TO env var, comma-separated for multiple addresses.
       e.g. NRFI_SES_TO="alice@example.com,bob@example.com"
@@ -726,14 +753,45 @@ def send_email(html_body, subject, date_str):
         return
     try:
         import boto3
-        boto3.client('ses', region_name='us-east-1').send_email(
-            Source=ses_from,
-            Destination={'ToAddresses': recipients},
-            Message={
-                'Subject': {'Data': subject},
-                'Body':    {'Html': {'Data': html_body, 'Charset': 'UTF-8'}},
-            },
-        )
+        ses = boto3.client('ses', region_name='us-east-1')
+        if chart_bytes:
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text     import MIMEText
+            from email.mime.image    import MIMEImage
+            chart_img_html = (
+                '<div style="margin-bottom:28px">'
+                '<img src="cid:threshold_chart" alt="7-day threshold timeline" '
+                'style="max-width:100%;height:auto;display:block"></div>'
+            )
+            html_with_chart = html_body.replace(
+                '<!-- THRESHOLD_CHART_PLACEHOLDER -->', chart_img_html
+            )
+            msg = MIMEMultipart('related')
+            msg['Subject'] = subject
+            msg['From']    = ses_from
+            msg['To']      = ', '.join(recipients)
+            alt = MIMEMultipart('alternative')
+            alt.attach(MIMEText(html_with_chart, 'html', 'utf-8'))
+            msg.attach(alt)
+            img = MIMEImage(chart_bytes, 'png')
+            img.add_header('Content-ID', '<threshold_chart>')
+            img.add_header('Content-Disposition', 'inline', filename='threshold_chart.png')
+            msg.attach(img)
+            ses.send_raw_email(
+                Source=ses_from,
+                Destinations=recipients,
+                RawMessage={'Data': msg.as_bytes()},
+            )
+        else:
+            html_clean = html_body.replace('<!-- THRESHOLD_CHART_PLACEHOLDER -->', '')
+            ses.send_email(
+                Source=ses_from,
+                Destination={'ToAddresses': recipients},
+                Message={
+                    'Subject': {'Data': subject},
+                    'Body':    {'Html': {'Data': html_clean, 'Charset': 'UTF-8'}},
+                },
+            )
         print(f'  Email sent to {", ".join(recipients)}')
     except Exception as ex:
         print(f'  WARNING: SES send failed ({ex})')
@@ -844,11 +902,42 @@ def grade_yesterday():
         except Exception:
             existing = pd.DataFrame()
         combined = pd.concat([existing, log_df], ignore_index=True)
+
+        # Backfill missing odds for confident picks across all historical dates
+        try:
+            from utils.odds_backfill import backfill_missing_odds
+            combined = backfill_missing_odds(combined, s3, s3_bucket, HIST_ODDS_API_KEY)
+        except Exception as _bf_ex:
+            print(f'  WARNING: odds backfill failed ({_bf_ex})')
+
         buf = io.BytesIO()
         combined.to_csv(buf, index=False)
         s3.put_object(Bucket=s3_bucket, Key=results_log_key,
                       Body=buf.getvalue(), ContentType='text/csv')
         print(f'  Results log updated: s3://{s3_bucket}/{results_log_key}')
+
+        # Emit yesterday's performance metrics (use combined so backfilled odds are included)
+        _yest_rows = combined[(combined['date'] == ystr) & combined['lr_confident'] & combined['lr_correct'].notna()]
+        if not _yest_rows.empty:
+            _w = int(_yest_rows['lr_correct'].sum())
+            _l = len(_yest_rows) - _w
+            cw_metric('YesterdayWins',   _w)
+            cw_metric('YesterdayLosses', _l)
+            _pl_vals = [compute_pl(r['lr_correct'], r['lr_pred'], r.get('nrfi_odds'), r.get('yrfi_odds'))
+                        for _, r in _yest_rows.iterrows()]
+            cw_metric('YesterdayPL', sum(v for v in _pl_vals if v is not None), unit='None')
+
+        # YTD P/L metric
+        _ytd_rows = combined[
+            combined['date'].str.startswith(str(TODAY.year)) &
+            combined['lr_confident'] &
+            combined['lr_correct'].notna()
+        ] if not combined.empty else pd.DataFrame()
+        if not _ytd_rows.empty:
+            _ytd_pl_vals = [compute_pl(r['lr_correct'], r['lr_pred'], r.get('nrfi_odds'), r.get('yrfi_odds'))
+                            for _, r in _ytd_rows.iterrows()]
+            cw_metric('YTDProfitLoss', sum(v for v in _ytd_pl_vals if v is not None), unit='None')
+
     except Exception as ex:
         print(f'  WARNING: could not update results log ({ex})')
 
@@ -1025,7 +1114,7 @@ else:
     es = tf.keras.callbacks.EarlyStopping(
         monitor='val_loss', patience=10, restore_best_weights=True, verbose=0
     )
-    nn.fit(X_nn_all, y, epochs=150, batch_size=64,
+    nn.fit(X_nn_all, y, epochs=50, batch_size=64,
            validation_split=0.1, shuffle=True, callbacks=[es], verbose=0)
     print(f'  Trained from scratch on {len(y)} games')
     if uses_s3:
@@ -1040,8 +1129,11 @@ for tr, vl in kf_nn.split(X_raw, y):
     X_tr_nn = sc_nn.fit_transform(X_raw[tr])
     X_vl_nn = sc_nn.transform(X_raw[vl])
     m_nn = _build_nn(X_tr_nn.shape[1])
-    m_nn.fit(X_tr_nn, y[tr], epochs=60, batch_size=64,
-             validation_split=0.1, verbose=0)
+    es_cv = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss', patience=10, restore_best_weights=True, verbose=0
+    )
+    m_nn.fit(X_tr_nn, y[tr], epochs=50, batch_size=64,
+             validation_split=0.1, callbacks=[es_cv], verbose=0)
     nn_cv_probs_all.append(m_nn.predict(X_vl_nn, verbose=0).flatten())
     nn_cv_y_all.append(y[vl])
     tf.keras.backend.clear_session()
@@ -1059,9 +1151,16 @@ for t in np.round(np.arange(0.52, 0.631, 0.005), 3):
 nn_best   = max(nn_eligible, key=lambda r: edge_score(r[1], r[3])) if nn_eligible else None
 nn_high   = nn_best[0] if nn_best else 0.545
 nn_low    = round(1 - nn_high, 3)
-nn_meta   = {'boundary': nn_cv_boundary}
+
+# Calibrate boundary from the production model's actual output distribution.
+# LR is guaranteed to match y.mean() by construction; NN is not — its sigmoid
+# outputs can sit systematically above or below the true base rate depending on
+# how it converged, causing directional disagreements on marginal games.
+nn_calibrated_boundary = float(nn.predict(X_nn_all, verbose=0).mean())
+nn_meta   = {'boundary': nn_calibrated_boundary}
 print(f'NN CV threshold:  <{nn_low} / >{nn_high}'
-      + (f'  (acc={nn_best[1]:.1%}, cov={nn_best[3]:.1%})' if nn_best else '  (fallback)'))
+      + (f'  (acc={nn_best[1]:.1%}, cov={nn_best[3]:.1%})' if nn_best else '  (fallback)')
+      + f'  [boundary={nn_calibrated_boundary:.4f} vs y.mean={y.mean():.4f}]')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 2 — CV THRESHOLD TUNING
@@ -1091,6 +1190,8 @@ THRESHOLD = best[0] if best else 0.545
 
 print(f'CV threshold:  <{round(1 - THRESHOLD, 3)} / >{THRESHOLD}  '
       f'(acc={best[1]:.1%}, cov={best[3]:.1%}, edge={edge_score(best[1], best[3]):.4f})')
+cw_metric('LRThreshold',  THRESHOLD,             unit='None')
+cw_metric('LRCVAccuracy', best[1] if best else 0.0, unit='None')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 3 — FETCH TODAY'S GAMES
@@ -1126,6 +1227,7 @@ name_to_abbv = {
     'New York Yankees':'NYY',   'San Francisco Giants':'SF','Oakland Athletics':'OAK',
     'Toronto Blue Jays':'TOR',  'Atlanta Braves':'ATL',     'Colorado Rockies':'COL',
     'Miami Marlins':'MIA',      'Kansas City Royals':'KC',
+    'Athletics':'OAK',
 }
 for g in games:
     g['away_abbv'] = name_to_abbv.get(g['away_abbv'], g['away_abbv'])
@@ -1476,6 +1578,10 @@ today_df['nn_confident'] = (nn_probs < nn_low) | (nn_probs > nn_high)
 today_df['consensus']    = today_df['lr_confident'] & today_df['nn_confident'] \
                            & (today_df['lr_pred'] == today_df['nn_pred'])
 
+cw_metric('LRPickCount',        int(today_df['lr_confident'].sum()))
+cw_metric('NNPickCount',        int(today_df['nn_confident'].sum()))
+cw_metric('ConsensusPickCount', int(today_df['consensus'].sum()))
+
 # EV — only when real odds available; computed for the prediction each model makes
 def compute_ev(probs_yrfi, preds, matchup_series):
     ev = []
@@ -1581,7 +1687,13 @@ nn_payload = print_picks_section(
     'nn_pred', 'nn_conf', 'nn_ev', 'nn_prob_nrfi', 'nn_prob_yrfi',
 )
 
-picks_payload = lr_payload + nn_payload
+# Drop any NN pick that contradicts LR's direction for the same game.
+# Without this, the email merges them into "NN,LR → YRFI" even when NN said NRFI.
+_lr_directions = {p['matchup']: p['prediction'] for p in lr_payload}
+_nn_filtered   = [p for p in nn_payload
+                  if p['matchup'] not in _lr_directions
+                  or p['prediction'] == _lr_directions[p['matchup']]]
+picks_payload = lr_payload + _nn_filtered
 
 deliver_picks(
     picks_payload, str(TODAY), THRESHOLD,
@@ -1705,10 +1817,11 @@ if yesterday_log_df is not None and not yesterday_log_df.empty:
         _lr_g = _conf[_conf['lr_confident'] & _conf['lr_correct'].notna()]
         _w = int(_lr_g['lr_correct'].sum()) if not _lr_g.empty else 0
         _l = len(_lr_g) - _w
-        _pl = sum(
-            _pick_pl(r['lr_correct'], r['lr_pred'], r.get('nrfi_odds'), r.get('yrfi_odds'))
+        _pl_vals = [
+            compute_pl(r['lr_correct'], r['lr_pred'], r.get('nrfi_odds'), r.get('yrfi_odds'))
             for _, r in _lr_g.iterrows() if pd.notna(r['lr_correct'])
-        )
+        ]
+        _pl   = sum(v for v in _pl_vals if v is not None)
         _sign = '+' if _pl >= 0 else ''
         _yest_summary = f' | Yesterday {_w}-{_l} ({_sign}${_pl:.2f})'
 
@@ -1731,4 +1844,14 @@ email_html = build_email_html(
     cv_acc=best[1] if best else 0.0,
     cv_cov=best[3] if best else 0.0,
 )
-send_email(email_html, email_subject, str(TODAY))
+
+# Build 7-day threshold timeline chart for email
+_chart_bytes = None
+try:
+    import boto3 as _b3_chart
+    _s3_chart = _b3_chart.client('s3')
+    _chart_bytes = build_threshold_timeline(_s3_chart, 'nrfi-store', TODAY)
+except Exception as _chart_ex:
+    print(f'  WARNING: chart generation failed ({_chart_ex})')
+
+send_email(email_html, email_subject, str(TODAY), chart_bytes=_chart_bytes)

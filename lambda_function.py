@@ -9,15 +9,38 @@ from unidecode import unidecode
 
 
 def lambda_handler(event, context):
-    result = main()
+    try:
+        result = main()
+    except Exception as e:
+        # Emit error metric, then re-raise so Lambda marks the invocation as failed
+        try:
+            boto3.client('cloudwatch', region_name='us-east-1').put_metric_data(
+                Namespace='NRFI/Pipeline',
+                MetricData=[{'MetricName': 'LambdaError', 'Value': 1, 'Unit': 'Count'}]
+            )
+        except Exception:
+            pass
+        raise
+
     if isinstance(result, str):
         return {'statusCode': 200, 'body': json.dumps(result)}
+
     df, date = result
     csv_string = df.to_csv(index=False)
     bucket_name = "nrfi-store"
     s3_path = "data/" + str(date.year) + "/" + str(date.month) + "/" + str(date.day) + ".txt"
     s3 = boto3.resource("s3")
     s3.Bucket(bucket_name).put_object(Key=s3_path, Body=csv_string)
+
+    # Emit games-collected metric for CloudWatch dashboard
+    try:
+        boto3.client('cloudwatch', region_name='us-east-1').put_metric_data(
+            Namespace='NRFI/Pipeline',
+            MetricData=[{'MetricName': 'GamesCollected', 'Value': len(df), 'Unit': 'Count'}]
+        )
+    except Exception as e:
+        print(f'CloudWatch metric failed: {e}')
+
     return {
         'statusCode': 200,
         'body': json.dumps(f'{date} — {len(df)} games saved to s3://{bucket_name}/{s3_path}')
@@ -113,7 +136,7 @@ def main():
         'WSH': {'team_pct': 'Washington',    'normal': 'WAS'},
         'NYM': {'team_pct': 'NY Mets',       'normal': 'NYM'},
         'MIN': {'team_pct': 'Minnesota',     'normal': 'MIN'},
-        'CWS': {'team_pct': 'Chi Sox',       'normal': 'CHW'},
+        'CWS': {'team_pct': 'Chi Sox',       'normal': 'CWS'},
         'SEA': {'team_pct': 'Seattle',       'normal': 'SEA'},
         'CLE': {'team_pct': 'Cleveland',     'normal': 'CLE'},
         'CHC': {'team_pct': 'Chi Cubs',      'normal': 'CHC'},
