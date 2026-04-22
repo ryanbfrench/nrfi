@@ -80,6 +80,7 @@ NN_MODEL_PATH  = os.environ.get('NRFI_NN_MODEL_PATH', 's3://nrfi-store/models/nn
 SESSION        = os.environ.get('SESSION', 'all')   # 'afternoon' | 'evening' | 'all'
 TODAY          = date.today()
 YESTERDAY      = TODAY - timedelta(days=1)
+SEASON_START   = date(2026, 4, 15)   # first date counted in YTD stats — based on training data cutoff
 
 # Cutoff for afternoon vs evening: 5pm ET = 21:00 UTC (EDT, April-October)
 AFTERNOON_CUTOFF_UTC_HOUR = 21
@@ -506,7 +507,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
             pred_color = G if pred == 'NRFI' else R
             nn_first = sorted(models_used, key=lambda x: 0 if x == 'NN' else 1)
             model_str = ','.join(nn_first)
-            nrfi_o = _odds_str(r.get('nrfi_odds')); yrfi_o = _odds_str(r.get('yrfi_odds'))
+            picked_odds = _odds_str(r.get('nrfi_odds') if pred == 'NRFI' else r.get('yrfi_odds'))
             pl_str = _pl_str(pl_val) if pl_val is not None else '—'
             matchup_disp = r['matchup'].replace('Athletics', 'ATH')
             rows_html += (
@@ -517,14 +518,14 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                 + td(model_str, color=MUT)
                 + td(actual)
                 + td(f'{r.get("lr_conf",0):.1%}', right=True)
-                + td(f'{nrfi_o} / {yrfi_o}', right=True, color=MUT)
+                + td(picked_odds, right=True, color=MUT)
                 + td(pl_str, right=True)
                 + '</tr>'
             )
         yest_tbl = (
             f'<table style="width:100%;border-collapse:collapse">'
             f'<tr>{th("Matchup")}{th("Result")}{th("Pick")}{th("Model")}{th("Actual")}'
-            f'{th("Conf",True)}{th("NRFI / YRFI Odds",True)}{th("P/L",True)}</tr>'
+            f'{th("Conf",True)}{th("Odds",True)}{th("P/L",True)}</tr>'
             + rows_html
             + f'<tr><td colspan="7" style="padding:6px 10px;font-size:12px;color:{MUT}">Total</td>'
             + td(_pl_str(total_pl), right=True) + '</tr></table>'
@@ -941,7 +942,7 @@ def grade_yesterday():
     except Exception as ex:
         print(f'  WARNING: could not update results log ({ex})')
 
-    ytd_df = (combined[combined['date'].str.startswith(str(TODAY.year))]
+    ytd_df = (combined[combined['date'] >= SEASON_START.isoformat()]
               if not combined.empty else pd.DataFrame())
     return log_df, ytd_df
 
@@ -1845,12 +1846,10 @@ email_html = build_email_html(
     cv_cov=best[3] if best else 0.0,
 )
 
-# Build 7-day threshold timeline chart for email
+# Build today's confidence threshold chart for email
 _chart_bytes = None
 try:
-    import boto3 as _b3_chart
-    _s3_chart = _b3_chart.client('s3')
-    _chart_bytes = build_threshold_timeline(_s3_chart, 'nrfi-store', TODAY)
+    _chart_bytes = build_threshold_timeline(today_df)
 except Exception as _chart_ex:
     print(f'  WARNING: chart generation failed ({_chart_ex})')
 
