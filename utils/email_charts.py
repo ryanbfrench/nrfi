@@ -1,44 +1,46 @@
 """
 utils/email_charts.py
 ---------------------
-Generates the confidence threshold chart embedded in the daily email,
-placed directly above the TODAY'S PICKS table.
+7-day confidence band timeline chart embedded in the daily email.
 
-Chart design: two panels (LR top, NN bottom), YRFI probability on X-axis.
-Each game is plotted as a dot:
-  - Blue   (NRFI pick):  prob < threshold_low
-  - Grey   (no pick):    threshold_low ≤ prob ≤ threshold_high
-  - Purple (YRFI pick):  prob > threshold_high
+Design: two panels (LR top, NN bottom). X-axis = dates (7 days), Y-axis = YRFI probability.
+Continuous shaded bands run left-to-right across all days:
+  - Blue   (NRFI zone): prob < threshold_low
+  - Grey   (no pick):   threshold_low ≤ prob ≤ threshold_high
+  - Purple (YRFI zone): prob > threshold_high
 
-Picked games are large filled dots labeled with their matchup (AWAY@HOME).
-Unpicked games are small hollow dots (no label — clutter reduction).
-Threshold lines are bold and labeled with their exact values so the reader
-immediately understands the criteria used in the table below.
+Threshold boundary lines are drawn as continuous lines that shift day-to-day.
+Game dots per day:
+  - Green  filled: confident pick, correct
+  - Red    filled: confident pick, incorrect
+  - Blue/purple filled: confident pick, ungraded (today)
+  - Hollow (small):  no pick
 
-Args: today_df — game log DataFrame produced by save_game_log().
-      Required columns: lr_prob_yrfi, lr_threshold_low, lr_threshold_high,
-      lr_confident, nn_prob_yrfi, nn_threshold_low, nn_threshold_high,
-      nn_confident, matchup.
+history_df must contain: game_date (YYYY-MM-DD str), matchup,
+lr_prob_yrfi, lr_threshold_low, lr_threshold_high, lr_confident,
+nn_prob_yrfi, nn_threshold_low, nn_threshold_high, nn_confident.
+Optional for result coloring: lr_correct, nn_correct (0/1/NaN).
 
-Returns PNG bytes for inline CID attachment, or None on any failure.
-Email falls back to plain HTML when None is returned.
+Returns PNG bytes for inline CID attachment, or None on failure.
 """
 
 import io
+from datetime import datetime
 
-COLOR_NRFI = '#2563eb'   # blue
-COLOR_YRFI = '#7c3aed'   # purple
-COLOR_NONE = '#9ca3af'   # grey
-COLOR_BAND = '#f3f4f6'   # light grey no-pick zone
-COLOR_TEXT = '#374151'
+COLOR_NRFI    = '#2563eb'   # blue
+COLOR_YRFI    = '#7c3aed'   # purple
+COLOR_NONE    = '#9ca3af'   # grey
+COLOR_BAND    = '#f3f4f6'   # light grey no-pick zone
+COLOR_TEXT    = '#374151'
+COLOR_WIN     = '#16a34a'   # green
+COLOR_LOSS    = '#dc2626'   # red
 
 
-def build_threshold_timeline(today_df):
+def build_threshold_timeline(history_df):
     """
-    Generate today's confidence threshold chart for LR and NN models.
-
-    Placed directly above the TODAY'S PICKS table in the email so the reader
-    can see exactly which probability zones trigger a pick.
+    Generate 7-day confidence band timeline for LR and NN models.
+    X-axis: game dates; Y-axis: YRFI probability.
+    Continuous bands + lines across all days; dots colored by result.
     """
     try:
         import matplotlib
@@ -50,161 +52,143 @@ def build_threshold_timeline(today_df):
     except ImportError:
         return None
 
-    if today_df is None or today_df.empty:
+    if history_df is None or history_df.empty:
+        return None
+
+    if 'game_date' not in history_df.columns:
         return None
 
     models = [
-        ('LR', 'lr_prob_yrfi', 'lr_threshold_low', 'lr_threshold_high', 'lr_confident'),
-        ('NN', 'nn_prob_yrfi', 'nn_threshold_low', 'nn_threshold_high', 'nn_confident'),
+        ('LR', 'lr_prob_yrfi', 'lr_threshold_low', 'lr_threshold_high', 'lr_confident', 'lr_correct'),
+        ('NN', 'nn_prob_yrfi', 'nn_threshold_low', 'nn_threshold_high', 'nn_confident', 'nn_correct'),
     ]
-    required = [col for _, p, lo, hi, c in models for col in (p, lo, hi, c)]
-    if not all(c in today_df.columns for c in required) or 'matchup' not in today_df.columns:
+    required = [col for _, p, lo, hi, c, _ in models for col in (p, lo, hi, c)]
+    if not all(c in history_df.columns for c in required) or 'matchup' not in history_df.columns:
         return None
 
-    try:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 4.2), facecolor='white',
-                                 gridspec_kw={'hspace': 0.82})
-        fig.subplots_adjust(left=0.04, right=0.97, top=0.88, bottom=0.10)
+    dates   = sorted(history_df['game_date'].unique())
+    n_days  = len(dates)
+    date_xi = {d: i for i, d in enumerate(dates)}
 
-        for ax_idx, (label, prob_col, low_col, high_col, conf_col) in enumerate(models):
+    def fmt_date(d):
+        try:
+            dt = datetime.strptime(str(d), '%Y-%m-%d')
+            return dt.strftime('%b %-d')
+        except Exception:
+            return str(d)[-5:]
+
+    try:
+        fig, axes = plt.subplots(2, 1, figsize=(10, 5.5), facecolor='white',
+                                 gridspec_kw={'hspace': 0.55})
+        fig.subplots_adjust(left=0.07, right=0.97, top=0.90, bottom=0.10)
+
+        for ax_idx, (label, prob_col, low_col, high_col, conf_col, correct_col) in enumerate(models):
             ax = axes[ax_idx]
             ax.set_facecolor('white')
 
-            rows = today_df[today_df[prob_col].notna()].copy()
+            rows = history_df[history_df[prob_col].notna()].copy()
             if rows.empty:
-                ax.set_title(f'{label} Model — no data today', fontsize=9, loc='left',
+                ax.set_title(f'{label} Model — no data', fontsize=9, loc='left',
                              color=COLOR_TEXT, pad=6)
-                ax.set_yticks([])
-                ax.set_xticks([])
+                ax.set_xticks(range(n_days))
+                ax.set_xticklabels([fmt_date(d) for d in dates], fontsize=7.5)
                 continue
 
-            probs    = rows[prob_col].astype(float).values
-            thr_low  = float(rows[low_col].iloc[0])
-            thr_high = float(rows[high_col].iloc[0])
+            # Build per-day threshold arrays for continuous band/line rendering
+            x_vals   = []
+            low_vals = []
+            hi_vals  = []
+            for date in dates:
+                xi       = date_xi[date]
+                day_rows = rows[rows['game_date'] == date]
+                if day_rows.empty:
+                    # Gap day: carry forward last known threshold or skip
+                    if x_vals:
+                        x_vals.append(xi)
+                        low_vals.append(low_vals[-1])
+                        hi_vals.append(hi_vals[-1])
+                    continue
+                x_vals.append(xi)
+                low_vals.append(float(day_rows[low_col].iloc[0]))
+                hi_vals.append(float(day_rows[high_col].iloc[0]))
 
-            # X range: cover all dots + thresholds with comfortable padding
-            pad   = 0.055
-            x_min = max(0.0, min(probs.min(), thr_low)  - pad)
-            x_max = min(1.0, max(probs.max(), thr_high) + pad)
-            if x_max - x_min < 0.25:
-                mid   = (x_min + x_max) / 2
-                x_min = max(0.0, mid - 0.125)
-                x_max = min(1.0, mid + 0.125)
+            if not x_vals:
+                continue
 
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(-0.6, 1.6)
-            ax.set_yticks([])
+            x_arr  = np.array(x_vals,   dtype=float)
+            lo_arr = np.array(low_vals,  dtype=float)
+            hi_arr = np.array(hi_vals,   dtype=float)
 
-            # ── Coloured background zones ─────────────────────────────────────
-            ax.axvspan(x_min,    thr_low,  color=COLOR_NRFI, alpha=0.07, zorder=0)
-            ax.axvspan(thr_low,  thr_high, color=COLOR_BAND, alpha=0.55, zorder=0)
-            ax.axvspan(thr_high, x_max,    color=COLOR_YRFI, alpha=0.07, zorder=0)
+            # Extend bands to full x-range edges so shading looks continuous
+            x_full  = np.concatenate([[x_arr[0] - 0.5], x_arr, [x_arr[-1] + 0.5]])
+            lo_full = np.concatenate([[lo_arr[0]], lo_arr, [lo_arr[-1]]])
+            hi_full = np.concatenate([[hi_arr[0]], hi_arr, [hi_arr[-1]]])
 
-            # ── Zone label strip at the top of the band ───────────────────────
-            zone_y = 1.42
-            for x_left, x_right, txt, col in [
-                (x_min,    thr_low,  'NRFI picks', COLOR_NRFI),
-                (thr_low,  thr_high, 'no pick',    COLOR_NONE),
-                (thr_high, x_max,    'YRFI picks',  COLOR_YRFI),
-            ]:
-                mid_x = (x_left + x_right) / 2
-                # Only draw if zone is wide enough to fit the label
-                zone_px = (x_right - x_left) / (x_max - x_min)
-                if zone_px > 0.05:
-                    ax.text(mid_x, zone_y, txt, ha='center', va='bottom',
-                            fontsize=7.5, color=col, style='italic',
-                            transform=ax.transData)
+            # ── Continuous shaded bands ───────────────────────────────────────
+            ax.fill_between(x_full, 0.0,     lo_full, color=COLOR_NRFI, alpha=0.13, zorder=0)
+            ax.fill_between(x_full, lo_full, hi_full, color=COLOR_BAND, alpha=0.65, zorder=0)
+            ax.fill_between(x_full, hi_full, 1.0,     color=COLOR_YRFI, alpha=0.13, zorder=0)
 
-            # ── Threshold lines ───────────────────────────────────────────────
-            for thr, col in ((thr_low, COLOR_NRFI), (thr_high, COLOR_YRFI)):
-                ax.axvline(thr, color=col, linewidth=1.8, linestyle='--',
-                           zorder=2, alpha=0.90)
-                # Value label on the line, above zone labels
-                ax.text(thr, 1.55, f'{thr:.3f}', ha='center', va='bottom',
-                        fontsize=8.5, color=col, fontweight='bold',
-                        transform=ax.transData)
+            # ── Threshold boundary lines ──────────────────────────────────────
+            x_line  = np.concatenate([[x_arr[0] - 0.5], x_arr, [x_arr[-1] + 0.5]])
+            ax.plot(x_line, lo_full, color=COLOR_NRFI, lw=1.6, alpha=0.8, zorder=2)
+            ax.plot(x_line, hi_full, color=COLOR_YRFI, lw=1.6, alpha=0.8, zorder=2)
 
-            # ── Game dots ────────────────────────────────────────────────────
-            Y_DOT = 0.5   # all dots on one horizontal strip
-            picked_items   = []   # (prob, matchup, color) for label pass
-            unpicked_probs = []
-            unpicked_cols  = []
+            # ── Game dots ─────────────────────────────────────────────────────
+            has_correct = correct_col in rows.columns
 
-            for _, row in rows.iterrows():
-                prob       = float(row[prob_col])
-                confident  = bool(row.get(conf_col, False))
-                matchup    = str(row.get('matchup', ''))
+            for date in dates:
+                xi       = date_xi[date]
+                day_rows = rows[rows['game_date'] == date]
+                for _, row in day_rows.iterrows():
+                    prob      = float(row[prob_col])
+                    confident = bool(row.get(conf_col, False))
+                    correct   = row[correct_col] if has_correct else float('nan')
 
-                if prob < thr_low:
-                    dot_color = COLOR_NRFI
-                elif prob > thr_high:
-                    dot_color = COLOR_YRFI
-                else:
-                    dot_color = COLOR_NONE
+                    if confident:
+                        if pd.notna(correct):
+                            dot_color = COLOR_WIN if int(correct) == 1 else COLOR_LOSS
+                        else:
+                            # Ungraded (today): use zone color
+                            dot_color = COLOR_NRFI if prob < float(row[low_col]) else (
+                                        COLOR_YRFI if prob > float(row[high_col]) else COLOR_NONE)
+                        ax.scatter([xi], [prob], c=dot_color, s=55, zorder=5, linewidths=0)
+                    else:
+                        zone_col = (COLOR_NRFI if prob < float(row[low_col]) else
+                                    COLOR_YRFI if prob > float(row[high_col]) else COLOR_NONE)
+                        ax.scatter([xi], [prob], c='none', edgecolors=[zone_col],
+                                   s=22, linewidths=1.0, zorder=3, alpha=0.5)
 
-                if confident:
-                    picked_items.append((prob, matchup, dot_color))
-                else:
-                    unpicked_probs.append(prob)
-                    unpicked_cols.append(dot_color)
+            # ── Axes ──────────────────────────────────────────────────────────
+            all_probs = rows[prob_col].astype(float)
+            y_lo = max(0.0, min(all_probs.min(), lo_arr.min()) - 0.04)
+            y_hi = min(1.0, max(all_probs.max(), hi_arr.max()) + 0.04)
+            if y_hi - y_lo < 0.20:
+                mid = (y_lo + y_hi) / 2
+                y_lo, y_hi = max(0.0, mid - 0.10), min(1.0, mid + 0.10)
 
-            # Unpicked: small hollow circles
-            if unpicked_probs:
-                ax.scatter(unpicked_probs, [Y_DOT] * len(unpicked_probs),
-                           c='none', edgecolors=unpicked_cols, s=28,
-                           linewidths=1.2, zorder=3, alpha=0.6)
+            # Three fixed Y ticks: threshold_low, 0.5, threshold_high
+            last_rows = rows[rows['game_date'] == dates[-1]]
+            tl = float(last_rows[low_col].iloc[0])  if not last_rows.empty else lo_arr[-1]
+            th = float(last_rows[high_col].iloc[0]) if not last_rows.empty else hi_arr[-1]
+            yticks = sorted({tl, 0.5, th})
+            ax.set_yticks(yticks)
+            ax.set_yticklabels([f'{v:.3f}' for v in yticks], fontsize=7)
 
-            # Picked: large filled circles
-            if picked_items:
-                px = [p for p, _, _ in picked_items]
-                pc = [c for _, _, c in picked_items]
-                ax.scatter(px, [Y_DOT] * len(picked_items),
-                           c=pc, s=90, zorder=5, linewidths=0)
+            ax.set_xlim(x_full[0], x_full[-1])
+            ax.set_ylim(y_lo, y_hi)
+            ax.set_xticks(range(n_days))
+            ax.set_xticklabels([fmt_date(d) for d in dates], fontsize=7.5)
+            ax.tick_params(axis='y', length=3, pad=3)
+            ax.tick_params(axis='x', labelsize=7.5, length=3, pad=3)
+            ax.set_ylabel('YRFI prob', fontsize=7.5, labelpad=4)
+            ax.grid(axis='y', color='#e5e7eb', linewidth=0.5, zorder=0)
+            ax.set_title(label, fontsize=9, loc='left', color=COLOR_TEXT, pad=6)
 
-            # ── Matchup labels for picked games ───────────────────────────────
-            # Sort by prob; alternate labels above/below the dot strip to
-            # reduce overlap when two picks land close together.
-            picked_items.sort(key=lambda x: x[0])
-            for i, (prob, matchup, col) in enumerate(picked_items):
-                above = (i % 2 == 0)
-                y_off = 11 if above else -16
-                va    = 'bottom' if above else 'top'
-                ax.annotate(
-                    matchup,
-                    xy=(prob, Y_DOT),
-                    xytext=(0, y_off),
-                    textcoords='offset points',
-                    ha='center', va=va,
-                    fontsize=7.0, color=col, fontweight='700',
-                )
-
-            # ── Title ─────────────────────────────────────────────────────────
-            n_nrfi = sum(1 for p, _, _ in picked_items if p < thr_low)
-            n_yrfi = sum(1 for p, _, _ in picked_items if p > thr_high)
-            pick_str = []
-            if n_nrfi:
-                pick_str.append(f'{n_nrfi} NRFI')
-            if n_yrfi:
-                pick_str.append(f'{n_yrfi} YRFI')
-            pick_summary = f'  ({", ".join(pick_str)})' if pick_str else '  (no picks today)'
-
-            ax.set_title(
-                f'{label} Model — NRFI < {thr_low:.3f}  |  YRFI > {thr_high:.3f}{pick_summary}',
-                fontsize=9, fontweight='bold', loc='left',
-                color=COLOR_TEXT, pad=6,
-            )
-
-            # ── X-axis ────────────────────────────────────────────────────────
-            ax.xaxis.set_major_formatter(mticker.FuncFormatter(
-                lambda v, _: f'{v:.2f}'
-            ))
-            ax.xaxis.set_major_locator(mticker.MultipleLocator(0.05))
-            ax.tick_params(axis='x', labelsize=7, length=3, pad=3)
-            ax.set_xlabel('YRFI probability', fontsize=7.5, labelpad=3)
-
-            for spine in ('top', 'right', 'left'):
+            for spine in ('top', 'right'):
                 ax.spines[spine].set_visible(False)
             ax.spines['bottom'].set_color('#e5e7eb')
+            ax.spines['left'].set_color('#e5e7eb')
 
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor='white')
