@@ -1,20 +1,21 @@
 """
 utils/email_charts.py
 ---------------------
-7-day confidence band timeline chart embedded in the daily email.
+7-day confidence band chart embedded in the daily email.
 
-Design: two panels (LR top, NN bottom). X-axis = dates (7 days), Y-axis = YRFI probability.
-Continuous shaded bands run left-to-right across all days:
-  - Blue   (NRFI zone): prob < threshold_low
-  - Grey   (no pick):   threshold_low ≤ prob ≤ threshold_high
-  - Purple (YRFI zone): prob > threshold_high
+Layout: 2 rows × 7 columns.
+  - Row 0: Logistic Regression
+  - Row 1: Neural Network
+  - Each column: one day's games
 
-Threshold boundary lines are drawn as continuous lines that shift day-to-day.
-Game dots per day:
-  - Green  filled: confident pick, correct
-  - Red    filled: confident pick, incorrect
-  - Blue/purple filled: confident pick, ungraded (today)
-  - Hollow (small):  no pick
+Within each cell:
+  - Horizontal shaded bands: NRFI (blue), no-pick (grey), YRFI (purple)
+  - Threshold boundary lines (horizontal)
+  - One dot per game; confident picks filled, unconfident hollow
+    - Green: confident + correct
+    - Red:   confident + incorrect
+    - Blue/purple: confident + ungraded (today)
+    - Hollow: no pick
 
 history_df must contain: game_date (YYYY-MM-DD str), matchup,
 lr_prob_yrfi, lr_threshold_low, lr_threshold_high, lr_confident,
@@ -27,26 +28,20 @@ Returns PNG bytes for inline CID attachment, or None on failure.
 import io
 from datetime import datetime
 
-COLOR_NRFI    = '#2563eb'   # blue
-COLOR_YRFI    = '#7c3aed'   # purple
-COLOR_NONE    = '#9ca3af'   # grey
-COLOR_BAND    = '#f3f4f6'   # light grey no-pick zone
-COLOR_TEXT    = '#374151'
-COLOR_WIN     = '#16a34a'   # green
-COLOR_LOSS    = '#dc2626'   # red
+COLOR_NRFI = '#2563eb'
+COLOR_YRFI = '#7c3aed'
+COLOR_NONE = '#9ca3af'
+COLOR_BAND = '#f3f4f6'
+COLOR_TEXT = '#374151'
+COLOR_WIN  = '#16a34a'
+COLOR_LOSS = '#dc2626'
 
 
 def build_threshold_timeline(history_df):
-    """
-    Generate 7-day confidence band timeline for LR and NN models.
-    X-axis: game dates; Y-axis: YRFI probability.
-    Continuous bands + lines across all days; dots colored by result.
-    """
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import matplotlib.ticker as mticker
         import numpy as np
         import pandas as pd
     except ImportError:
@@ -54,93 +49,69 @@ def build_threshold_timeline(history_df):
 
     if history_df is None or history_df.empty:
         return None
-
     if 'game_date' not in history_df.columns:
         return None
 
     models = [
-        ('LR', 'lr_prob_yrfi', 'lr_threshold_low', 'lr_threshold_high', 'lr_confident', 'lr_correct'),
-        ('NN', 'nn_prob_yrfi', 'nn_threshold_low', 'nn_threshold_high', 'nn_confident', 'nn_correct'),
+        ('Logistic Regression', 'lr_prob_yrfi', 'lr_threshold_low', 'lr_threshold_high', 'lr_confident', 'lr_correct'),
+        ('Neural Network',      'nn_prob_yrfi', 'nn_threshold_low', 'nn_threshold_high', 'nn_confident', 'nn_correct'),
     ]
     required = [col for _, p, lo, hi, c, _ in models for col in (p, lo, hi, c)]
     if not all(c in history_df.columns for c in required) or 'matchup' not in history_df.columns:
         return None
 
-    dates   = sorted(history_df['game_date'].unique())
-    n_days  = len(dates)
-    date_xi = {d: i for i, d in enumerate(dates)}
+    dates  = sorted(history_df['game_date'].unique())
+    n_days = len(dates)
 
     def fmt_date(d):
         try:
             dt = datetime.strptime(str(d), '%Y-%m-%d')
-            return dt.strftime('%b %-d')
+            return dt.strftime('%b') + ' ' + str(dt.day)
         except Exception:
             return str(d)[-5:]
 
     try:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 5.5), facecolor='white',
-                                 gridspec_kw={'hspace': 0.55})
-        fig.subplots_adjust(left=0.07, right=0.97, top=0.90, bottom=0.10)
+        fig, axes = plt.subplots(
+            2, n_days,
+            figsize=(max(2.2 * n_days, 8), 6),
+            facecolor='white',
+            gridspec_kw={'hspace': 0.30, 'wspace': 0.10},
+        )
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.88, bottom=0.06)
 
-        for ax_idx, (label, prob_col, low_col, high_col, conf_col, correct_col) in enumerate(models):
-            ax = axes[ax_idx]
-            ax.set_facecolor('white')
+        # Ensure axes is always shape (2, n_days)
+        if n_days == 1:
+            axes = np.array([[axes[0]], [axes[1]]])
 
-            rows = history_df[history_df[prob_col].notna()].copy()
-            if rows.empty:
-                ax.set_title(f'{label} Model — no data', fontsize=9, loc='left',
-                             color=COLOR_TEXT, pad=6)
-                ax.set_xticks(range(n_days))
-                ax.set_xticklabels([fmt_date(d) for d in dates], fontsize=7.5)
-                continue
+        for row_idx, (label, prob_col, low_col, high_col, conf_col, correct_col) in enumerate(models):
+            all_rows = history_df[history_df[prob_col].notna()].copy()
+            has_correct = correct_col in all_rows.columns
 
-            # Build per-day threshold arrays for continuous band/line rendering
-            x_vals   = []
-            low_vals = []
-            hi_vals  = []
-            for date in dates:
-                xi       = date_xi[date]
-                day_rows = rows[rows['game_date'] == date]
-                if day_rows.empty:
-                    # Gap day: carry forward last known threshold or skip
-                    if x_vals:
-                        x_vals.append(xi)
-                        low_vals.append(low_vals[-1])
-                        hi_vals.append(hi_vals[-1])
-                    continue
-                x_vals.append(xi)
-                low_vals.append(float(day_rows[low_col].iloc[0]))
-                hi_vals.append(float(day_rows[high_col].iloc[0]))
+            for col_idx, date in enumerate(dates):
+                ax = axes[row_idx, col_idx]
+                ax.set_facecolor('white')
+                for spine in ('top', 'right', 'bottom'):
+                    ax.spines[spine].set_visible(False)
+                ax.spines['left'].set_color('#e5e7eb')
 
-            if not x_vals:
-                continue
+                day_rows = all_rows[all_rows['game_date'] == date].copy()
 
-            x_arr  = np.array(x_vals,   dtype=float)
-            lo_arr = np.array(low_vals,  dtype=float)
-            hi_arr = np.array(hi_vals,   dtype=float)
+                # Threshold for this day
+                if not day_rows.empty:
+                    tl = float(day_rows[low_col].iloc[0])
+                    th = float(day_rows[high_col].iloc[0])
+                else:
+                    tl, th = 0.455, 0.545
 
-            # Extend bands to full x-range edges so shading looks continuous
-            x_full  = np.concatenate([[x_arr[0] - 0.5], x_arr, [x_arr[-1] + 0.5]])
-            lo_full = np.concatenate([[lo_arr[0]], lo_arr, [lo_arr[-1]]])
-            hi_full = np.concatenate([[hi_arr[0]], hi_arr, [hi_arr[-1]]])
+                # Horizontal bands
+                ax.axhspan(0.0, tl,  color=COLOR_NRFI, alpha=0.13, zorder=0)
+                ax.axhspan(tl,  th,  color=COLOR_BAND, alpha=0.65, zorder=0)
+                ax.axhspan(th,  1.0, color=COLOR_YRFI, alpha=0.13, zorder=0)
+                ax.axhline(tl, color=COLOR_NRFI, lw=1.2, alpha=0.8, zorder=2)
+                ax.axhline(th, color=COLOR_YRFI, lw=1.2, alpha=0.8, zorder=2)
 
-            # ── Continuous shaded bands ───────────────────────────────────────
-            ax.fill_between(x_full, 0.0,     lo_full, color=COLOR_NRFI, alpha=0.13, zorder=0)
-            ax.fill_between(x_full, lo_full, hi_full, color=COLOR_BAND, alpha=0.65, zorder=0)
-            ax.fill_between(x_full, hi_full, 1.0,     color=COLOR_YRFI, alpha=0.13, zorder=0)
-
-            # ── Threshold boundary lines ──────────────────────────────────────
-            x_line  = np.concatenate([[x_arr[0] - 0.5], x_arr, [x_arr[-1] + 0.5]])
-            ax.plot(x_line, lo_full, color=COLOR_NRFI, lw=1.6, alpha=0.8, zorder=2)
-            ax.plot(x_line, hi_full, color=COLOR_YRFI, lw=1.6, alpha=0.8, zorder=2)
-
-            # ── Game dots ─────────────────────────────────────────────────────
-            has_correct = correct_col in rows.columns
-
-            for date in dates:
-                xi       = date_xi[date]
-                day_rows = rows[rows['game_date'] == date]
-                for _, row in day_rows.iterrows():
+                # Game dots
+                for g_idx, (_, row) in enumerate(day_rows.iterrows()):
                     prob      = float(row[prob_col])
                     confident = bool(row.get(conf_col, False))
                     correct   = row[correct_col] if has_correct else float('nan')
@@ -149,46 +120,37 @@ def build_threshold_timeline(history_df):
                         if pd.notna(correct):
                             dot_color = COLOR_WIN if int(correct) == 1 else COLOR_LOSS
                         else:
-                            # Ungraded (today): use zone color
-                            dot_color = COLOR_NRFI if prob < float(row[low_col]) else (
-                                        COLOR_YRFI if prob > float(row[high_col]) else COLOR_NONE)
-                        ax.scatter([xi], [prob], c=dot_color, s=55, zorder=5, linewidths=0)
+                            dot_color = (COLOR_NRFI if prob < tl else
+                                         COLOR_YRFI if prob > th else COLOR_NONE)
+                        ax.scatter([g_idx], [prob], c=dot_color, s=50, zorder=5, linewidths=0)
                     else:
-                        zone_col = (COLOR_NRFI if prob < float(row[low_col]) else
-                                    COLOR_YRFI if prob > float(row[high_col]) else COLOR_NONE)
-                        ax.scatter([xi], [prob], c='none', edgecolors=[zone_col],
+                        zone_col = (COLOR_NRFI if prob < tl else
+                                    COLOR_YRFI if prob > th else COLOR_NONE)
+                        ax.scatter([g_idx], [prob], c='none', edgecolors=[zone_col],
                                    s=22, linewidths=1.0, zorder=3, alpha=0.5)
 
-            # ── Axes ──────────────────────────────────────────────────────────
-            all_probs = rows[prob_col].astype(float)
-            y_lo = max(0.0, min(all_probs.min(), lo_arr.min()) - 0.04)
-            y_hi = min(1.0, max(all_probs.max(), hi_arr.max()) + 0.04)
-            if y_hi - y_lo < 0.20:
-                mid = (y_lo + y_hi) / 2
-                y_lo, y_hi = max(0.0, mid - 0.10), min(1.0, mid + 0.10)
+                # Column date header (top row only, centered)
+                if row_idx == 0:
+                    ax.set_title(fmt_date(date), fontsize=8, color=COLOR_TEXT, pad=4, loc='center')
 
-            # Three fixed Y ticks: threshold_low, 0.5, threshold_high
-            last_rows = rows[rows['game_date'] == dates[-1]]
-            tl = float(last_rows[low_col].iloc[0])  if not last_rows.empty else lo_arr[-1]
-            th = float(last_rows[high_col].iloc[0]) if not last_rows.empty else hi_arr[-1]
-            yticks = sorted({tl, 0.5, th})
-            ax.set_yticks(yticks)
-            ax.set_yticklabels([f'{v:.3f}' for v in yticks], fontsize=7)
+                # Row label above leftmost column (left-aligned, doesn't overwrite centered date)
+                if col_idx == 0:
+                    ax.set_title(label, fontsize=9, color=COLOR_TEXT, pad=4, loc='left',
+                                 fontweight='semibold')
 
-            ax.set_xlim(x_full[0], x_full[-1])
-            ax.set_ylim(y_lo, y_hi)
-            ax.set_xticks(range(n_days))
-            ax.set_xticklabels([fmt_date(d) for d in dates], fontsize=7.5)
-            ax.tick_params(axis='y', length=3, pad=3)
-            ax.tick_params(axis='x', labelsize=7.5, length=3, pad=3)
-            ax.set_ylabel('YRFI prob', fontsize=7.5, labelpad=4)
-            ax.grid(axis='y', color='#e5e7eb', linewidth=0.5, zorder=0)
-            ax.set_title(label, fontsize=9, loc='left', color=COLOR_TEXT, pad=6)
+                # Y-axis: ticks only on leftmost column
+                if col_idx == 0:
+                    yticks = sorted({tl, 0.5, th})
+                    ax.set_yticks(yticks)
+                    ax.set_yticklabels([f'{v:.3f}' for v in yticks], fontsize=6.5)
+                    ax.tick_params(axis='y', length=3, pad=2)
+                else:
+                    ax.set_yticks([])
 
-            for spine in ('top', 'right'):
-                ax.spines[spine].set_visible(False)
-            ax.spines['bottom'].set_color('#e5e7eb')
-            ax.spines['left'].set_color('#e5e7eb')
+                ax.set_xticks([])
+                ax.set_ylim(0.35, 0.65)
+                n_games = max(len(day_rows), 1)
+                ax.set_xlim(-0.7, n_games - 0.3)
 
         buf = io.BytesIO()
         fig.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor='white')

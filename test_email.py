@@ -1,164 +1,97 @@
 """
-test_email.py
--------------
-Send a test email using existing S3 data — no model retraining.
-Renders the full production email (same HTML as the daily run).
-
-Requires .env with SES_FROM and SES_TO.
-
-Usage:
-    python test_email.py
+test_email.py — send a test email to verify the new subject format and chart layout.
+Run from the project root: python test_email.py
 """
 
-import io, json, os, subprocess
+import os, sys
+import numpy as np
+import pandas as pd
+import random
 from datetime import date, timedelta
 from pathlib import Path
 
-import boto3
-import pandas as pd
-from dotenv import load_dotenv
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-load_dotenv(Path(__file__).parent / '.env')
-
-# ── AWS creds from CLI ────────────────────────────────────────────────────────
-try:
-    _raw = subprocess.check_output(
-        ['aws', 'configure', 'export-credentials', '--format', 'env-no-export'],
-        text=True, stderr=subprocess.DEVNULL,
-    )
-    for _line in _raw.splitlines():
-        if '=' in _line:
-            k, v = _line.split('=', 1)
-            os.environ.setdefault(k.strip(), v.strip())
-except Exception:
-    pass
-
-# Override SES env vars from .env so send_email picks them up
-os.environ['NRFI_SES_FROM'] = os.environ['SES_FROM']
-os.environ['NRFI_SES_TO']   = os.environ['SES_TO']
+# Load .env
+_env = Path(__file__).parent / '.env'
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith('#') and '=' in _line:
+            _k, _v = _line.split('=', 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 from utils.email_charts import build_threshold_timeline
-from utils.email_html   import build_email_html, send_email
-from utils.pl_calc      import compute_pl
+from utils.email_html   import send_email
 
-TODAY     = date.today()
-YESTERDAY = TODAY - timedelta(days=1)
-BUCKET    = 'nrfi-store'
-UNIT      = 10
+random.seed(42)
+np.random.seed(42)
 
-s3 = boto3.client('s3')
+# ── Fake 7-day history ───────────────────────────────────────────────────────
+today = date.today()
+dates = [(today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
 
+MATCHUPS = [
+    'NYY @ BOS', 'LAD @ SF', 'HOU @ TEX', 'ATL @ NYM',
+    'CHC @ MIL', 'MIN @ DET', 'SEA @ OAK', 'CLE @ KC',
+    'TOR @ TB',  'PHI @ WSH', 'CIN @ PIT', 'COL @ ARI',
+    'STL @ MIA', 'BAL @ DET', 'SD @ LAA',
+]
 
-def s3_csv(key):
-    try:
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
-        df  = pd.read_csv(io.BytesIO(obj['Body'].read()))
-        print(f'  loaded {key} ({len(df)} rows)')
-        return df
-    except Exception as e:
-        print(f'  missing {key}: {e}')
-        return None
+rows = []
+for d in dates:
+    n_games = random.randint(10, 15)
+    for matchup in random.sample(MATCHUPS, min(n_games, len(MATCHUPS))):
+        lr_prob = round(random.uniform(0.38, 0.62), 4)
+        nn_prob = round(random.uniform(0.38, 0.62), 4)
+        tl, th  = 0.455, 0.545
+        lr_conf = lr_prob < tl or lr_prob > th
+        nn_conf = nn_prob < tl or nn_prob > th
+        graded  = d < today.isoformat()
+        rows.append({
+            'game_date':          d,
+            'matchup':            matchup,
+            'lr_prob_yrfi':       lr_prob,
+            'lr_threshold_low':   tl,
+            'lr_threshold_high':  th,
+            'lr_confident':       lr_conf,
+            'lr_correct':         float(random.random() > 0.44) if (lr_conf and graded) else float('nan'),
+            'nn_prob_yrfi':       nn_prob,
+            'nn_threshold_low':   tl,
+            'nn_threshold_high':  th,
+            'nn_confident':       nn_conf,
+            'nn_correct':         float(random.random() > 0.44) if (nn_conf and graded) else float('nan'),
+        })
 
+history_df = pd.DataFrame(rows)
 
-# ── Load data from S3 ─────────────────────────────────────────────────────────
-print('Loading S3 data...')
-today_df     = s3_csv(f'game_log/{TODAY.year}/{TODAY.isoformat()}.csv')
-yesterday_df = s3_csv(f'game_log/{YESTERDAY.year}/{YESTERDAY.isoformat()}.csv')
-results_df   = s3_csv('results/results.csv')
+# ── Generate chart ───────────────────────────────────────────────────────────
+chart_bytes = build_threshold_timeline(history_df)
+print(f'Chart: {len(chart_bytes) if chart_bytes else 0} bytes')
 
-picks_payload = []
-try:
-    obj = s3.get_object(Bucket=BUCKET, Key=f'picks/{TODAY.year}/{TODAY.isoformat()}.json')
-    picks_payload = json.loads(obj['Body'].read()).get('picks', [])
-    print(f'  loaded {len(picks_payload)} picks')
-except Exception as e:
-    print(f'  missing picks JSON: {e}')
+# ── Subject (mirrors daily_picks.py logic) ────────────────────────────────────
+_date_label    = today.strftime('%b') + ' ' + str(today.day)
+_picks_summary = '3 picks, 1 consensus'
+_yest_summary  = ' | Yesterday 5-0 (+$39.82)'
+email_subject  = f'NRFI {_date_label} | {_picks_summary}{_yest_summary}'
+print(f'Subject: {email_subject}')
 
-# ── YTD df (season slice of results) ─────────────────────────────────────────
-ytd_df = None
-if results_df is not None and not results_df.empty:
-    season_start = f'{TODAY.year}-04-15'
-    ytd_df = results_df[results_df['date'] >= season_start].copy()
+# ── Simple HTML body ──────────────────────────────────────────────────────────
+html_body = f"""
+<html><body style="font-family:sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#111827">
+  <h2 style="margin-bottom:4px">NRFI Test Email</h2>
+  <p style="color:#6b7280;margin-top:0">Subject format + chart layout verification &mdash; {today}</p>
+  <p><strong>Subject line:</strong><br>
+     <code style="background:#f3f4f6;padding:4px 8px;border-radius:4px">{email_subject}</code></p>
+  <p>This email verifies:
+    <ul>
+      <li>New subject format: <code>NRFI Apr 26 | 3 picks | Yesterday 5-0 (+$39.82)</code></li>
+      <li>New chart: 2 rows &times; 7 columns (one column per day)</li>
+      <li>Row titles: &ldquo;Logistic Regression&rdquo; and &ldquo;Neural Network&rdquo;</li>
+    </ul>
+  </p>
+  <!-- THRESHOLD_CHART_PLACEHOLDER -->
+</body></html>
+"""
 
-# ── Merge yesterday actuals into yesterday_df ─────────────────────────────────
-if yesterday_df is not None and results_df is not None:
-    res = results_df[['date', 'matchup', 'lr_correct', 'nn_correct', 'actual_yrfi']].copy()
-    res = res[res['date'] == str(YESTERDAY)].drop(columns='date')
-    yesterday_df = yesterday_df.drop(columns=['lr_correct', 'nn_correct', 'actual_yrfi'], errors='ignore')
-    yesterday_df = yesterday_df.merge(res, on='matchup', how='left')
-
-# ── 7-day history for chart ───────────────────────────────────────────────────
-print('Loading 7-day history for chart...')
-hist_dfs = []
-for d_off in range(6, -1, -1):
-    hd  = TODAY - timedelta(days=d_off)
-    hdf = s3_csv(f'game_log/{hd.year}/{hd.isoformat()}.csv')
-    if hdf is not None:
-        hdf['game_date'] = str(hd)
-        hist_dfs.append(hdf)
-
-if hist_dfs:
-    history = pd.concat(hist_dfs, ignore_index=True)
-elif today_df is not None:
-    history = today_df.copy()
-    history['game_date'] = str(TODAY)
-else:
-    history = pd.DataFrame()
-
-# Merge lr_correct/nn_correct from results (game logs save these as None at pick time)
-if results_df is not None and not history.empty:
-    res = results_df[['date', 'matchup', 'lr_correct', 'nn_correct']].rename(columns={'date': 'game_date'})
-    history = history.drop(columns=['lr_correct', 'nn_correct'], errors='ignore')
-    history = history.merge(res, on=['game_date', 'matchup'], how='left')
-
-# ── Build chart ───────────────────────────────────────────────────────────────
-print('Building chart...')
-chart_bytes = build_threshold_timeline(history)
-print(f'Chart: {len(chart_bytes)} bytes' if chart_bytes else 'Chart: None')
-
-# ── Email subject ─────────────────────────────────────────────────────────────
-yest_summary = ''
-if yesterday_df is not None and not yesterday_df.empty:
-    conf   = yesterday_df[yesterday_df['lr_confident'] | yesterday_df['nn_confident']]
-    graded = conf[conf['lr_correct'].notna() | conf['nn_correct'].notna()]
-    if not graded.empty:
-        corrects, pl_vals = [], []
-        for _, r in graded.iterrows():
-            if r.get('lr_confident') and pd.notna(r.get('lr_correct')):
-                corrects.append(int(r['lr_correct']))
-                v = compute_pl(r['lr_correct'], r['lr_pred'], r.get('nrfi_odds'), r.get('yrfi_odds'))
-            elif r.get('nn_confident') and pd.notna(r.get('nn_correct')):
-                corrects.append(int(r['nn_correct']))
-                v = compute_pl(r['nn_correct'], r['nn_pred'], r.get('nrfi_odds'), r.get('yrfi_odds'))
-            else:
-                v = None
-            if v is not None:
-                pl_vals.append(v)
-        w, l = sum(corrects), len(corrects) - sum(corrects)
-        pl   = sum(pl_vals)
-        yest_summary = f' | Yesterday {w}-{l} ({("+" if pl >= 0 else "")}${pl:.2f})'
-
-n_picks = len([p for p in picks_payload if not p.get('consensus')])
-n_cons  = len([p for p in picks_payload if p.get('consensus')])
-picks_s = f'{n_picks} pick{"s" if n_picks != 1 else ""}' + (f', {n_cons} consensus' if n_cons else '')
-subject = f'[TEST] NRFI {TODAY} — {picks_s}{yest_summary}'
-print(f'Subject: {subject}')
-
-# ── Build and send full production email ─────────────────────────────────────
-email_html = build_email_html(
-    date_str=str(TODAY),
-    picks_rows=picks_payload,
-    yesterday_rows=yesterday_df,
-    ytd_df=ytd_df,
-    today_df_all=today_df,
-    lr_threshold=0.545,
-    nn_threshold=0.545,
-    cv_acc=0.0,
-    cv_cov=0.0,
-    yesterday=YESTERDAY,
-    today=TODAY,
-    unit=UNIT,
-    get_odds_fn=None,   # uses stored odds from game log; no live scrape
-)
-
-send_email(email_html, subject, str(TODAY), chart_bytes=chart_bytes)
+send_email(html_body, email_subject, today.isoformat(), chart_bytes=chart_bytes)

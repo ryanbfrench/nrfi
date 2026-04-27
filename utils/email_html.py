@@ -320,20 +320,35 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
 
 def send_email(html_body, subject, date_str, chart_bytes=None):
     """Send daily picks email via SES. Recipients from NRFI_SES_FROM / NRFI_SES_TO env vars."""
-    ses_from = os.environ.get('NRFI_SES_FROM')
-    ses_to   = os.environ.get('NRFI_SES_TO', '')
+    ses_from = os.environ.get('NRFI_SES_FROM') or os.environ.get('SES_FROM')
+    ses_to   = os.environ.get('NRFI_SES_TO')  or os.environ.get('SES_TO', '')
     if not ses_from or not ses_to:
-        print('  Email skipped: NRFI_SES_FROM / NRFI_SES_TO not set')
+        print('  Email skipped: SES_FROM / SES_TO not set')
         return
     recipients = [a.strip() for a in ses_to.split(',') if a.strip()]
     if not recipients:
         return
     try:
+        import json, subprocess
         import boto3
         from email.mime.image     import MIMEImage
         from email.mime.multipart import MIMEMultipart
         from email.mime.text      import MIMEText
-        ses = boto3.client('ses', region_name='us-east-1')
+        # Try standard credential chain first; fall back to aws cli credential process
+        _session = boto3.Session()
+        if _session.get_credentials() is None:
+            _r = subprocess.run(
+                ['aws', 'configure', 'export-credentials', '--format', 'process'],
+                capture_output=True, text=True, timeout=10,
+            )
+            _c = json.loads(_r.stdout)
+            _session = boto3.Session(
+                aws_access_key_id=_c['AccessKeyId'],
+                aws_secret_access_key=_c['SecretAccessKey'],
+                aws_session_token=_c.get('SessionToken'),
+                region_name='us-east-1',
+            )
+        ses = _session.client('ses', region_name='us-east-1')
         if chart_bytes:
             chart_img_html = (
                 '<div style="margin-bottom:28px">'

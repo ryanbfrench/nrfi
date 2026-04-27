@@ -88,7 +88,7 @@ SEASON_START   = date(2026, 4, 15)   # first date counted in YTD stats — based
 # Cutoff for afternoon vs evening: 5pm ET = 21:00 UTC (EDT, April-October)
 AFTERNOON_CUTOFF_UTC_HOUR = 21
 MIN_COVERAGE       = 0.10
-MAX_COVERAGE       = 0.25
+MAX_COVERAGE       = 0.15
 UNIT               = 10    # dollars per unit
 HIST_ODDS_API_KEY  = os.environ.get('HISTORICAL_ODDS_API_KEY')
 RECENCY_HALF_LIFE  = 365   # days; games 1yr old carry ~37% weight, 2yr ~14%, 3yr ~5%
@@ -1205,10 +1205,11 @@ today_df['nn_pred']      = np.where(nn_probs > nn_meta['boundary'], 'YRFI', 'NRF
 today_df['nn_conf']      = np.where(nn_probs > nn_meta['boundary'], nn_probs, 1 - nn_probs)
 
 LOW, HIGH = round(1 - THRESHOLD, 3), THRESHOLD
-today_df['lr_confident'] = (lr_probs < LOW) | (lr_probs > HIGH)
-today_df['nn_confident'] = (nn_probs < nn_low) | (nn_probs > nn_high)
+_models_agree_direction = today_df['lr_pred'] == today_df['nn_pred']
+today_df['lr_confident'] = ((lr_probs < LOW) | (lr_probs > HIGH)) & _models_agree_direction
+today_df['nn_confident'] = ((nn_probs < nn_low) | (nn_probs > nn_high)) & _models_agree_direction
 today_df['consensus']    = today_df['lr_confident'] & today_df['nn_confident'] \
-                           & (today_df['lr_pred'] == today_df['nn_pred'])
+                           & _models_agree_direction
 
 cw_metric('LRPickCount',        int(today_df['lr_confident'].sum()))
 cw_metric('NNPickCount',        int(today_df['nn_confident'].sum()))
@@ -1471,7 +1472,8 @@ _picks_summary = f'{_n_picks} pick{"s" if _n_picks != 1 else ""}'
 if _n_cons:
     _picks_summary += f', {_n_cons} consensus'
 _session_label = {'afternoon': ' (Afternoon)', 'evening': ' (Evening)', 'all': ''}.get(SESSION, '')
-email_subject = f'NRFI {str(TODAY)}{_session_label} — {_picks_summary}{_yest_summary}'
+_date_label = (TODAY.strftime('%b') + ' ' + str(TODAY.day)) if hasattr(TODAY, 'strftime') else str(TODAY)
+email_subject = f'NRFI {_date_label}{_session_label} | {_picks_summary}{_yest_summary}'
 
 email_html = build_email_html(
     date_str=str(TODAY),
