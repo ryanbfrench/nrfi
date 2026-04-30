@@ -189,10 +189,16 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
     # ── Helper: build a single-row game block ─────────────────────────────────
     def game_rows(r, picked=False, pick_info=None):
         matchup = r['matchup'].replace('Athletics', 'ATH')
-        lrc  = G if r['lr_pred'] == 'NRFI' else R
-        nnc  = G if r['nn_pred'] == 'NRFI' else R
-        lrfw = '700' if r['lr_confident'] else '400'
-        nnfw = '700' if r['nn_confident'] else '400'
+        # Color only when the model is actually confident (making a pick).
+        # Not-confident games show grey — regardless of which side of the
+        # calibrated mean the probability sits on — to avoid implying a
+        # directional lean when no pick was made.
+        lr_conf = bool(r.get('lr_confident', False))
+        nn_conf = bool(r.get('nn_confident', False))
+        lrc  = (G if r['lr_pred'] == 'NRFI' else R) if lr_conf else MUT
+        nnc  = (G if r['nn_pred'] == 'NRFI' else R) if nn_conf else MUT
+        lrfw = '700' if lr_conf else '400'
+        nnfw = '700' if nn_conf else '400'
 
         if get_odds_fn is not None:
             bo = get_odds_fn(matchup)
@@ -312,6 +318,12 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
   <div style="margin-top:32px;padding-top:12px;border-top:1px solid {BDR};
               font-size:11px;color:{MUT};text-align:center">
     Generated {gen_time} {tz_name} &nbsp;&middot;&nbsp; 1u = ${unit}
+    &nbsp;&middot;&nbsp;
+    LR &lt;{round(1-lr_threshold,3)} / &gt;{lr_threshold}
+    &nbsp;&middot;&nbsp;
+    NN &lt;{round(1-nn_threshold,3)} / &gt;{nn_threshold}
+    &nbsp;&middot;&nbsp;
+    CV {cv_acc:.1%} acc &nbsp;{cv_cov:.1%} cov
   </div>
 </div>
 </body></html>"""

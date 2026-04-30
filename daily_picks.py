@@ -1205,7 +1205,9 @@ today_df['nn_pred']      = np.where(nn_probs > nn_meta['boundary'], 'YRFI', 'NRF
 today_df['nn_conf']      = np.where(nn_probs > nn_meta['boundary'], nn_probs, 1 - nn_probs)
 
 LOW, HIGH = round(1 - THRESHOLD, 3), THRESHOLD
-_models_agree_direction = today_df['lr_pred'] == today_df['nn_pred']
+# Use 0.5 for direction agreement — calibrated NN boundary can drift above 0.50,
+# which would classify a 51% NN output as NRFI and cause spurious disagreements.
+_models_agree_direction = (lr_probs > 0.5) == (nn_probs > 0.5)
 today_df['lr_confident'] = ((lr_probs < LOW) | (lr_probs > HIGH)) & _models_agree_direction
 today_df['nn_confident'] = ((nn_probs < nn_low) | (nn_probs > nn_high)) & _models_agree_direction
 today_df['consensus']    = today_df['lr_confident'] & today_df['nn_confident'] \
@@ -1414,7 +1416,7 @@ def save_game_log(df, date_str, lr_threshold, nn_threshold_low, nn_threshold_hig
 
 save_game_log(
     today_df, str(TODAY), THRESHOLD,
-    LOW, HIGH,
+    nn_low, nn_high,
     BOUNDARY, nn_meta['boundary'],
     best[1] if best else 0.0,
     best[3] if best else 0.0,
@@ -1492,33 +1494,27 @@ email_html = build_email_html(
 )
 
 # Build 7-day confidence band timeline chart for email
+# Use ytd_df (already loaded from results.csv) + today_df — avoids separate S3 reads
+# and ensures the chart has data even if individual game_log files don't yet exist.
 _chart_bytes = None
 try:
-    import boto3 as _b3c, io as _ioc
-    _s3c = _b3c.client('s3')
     _hist_dfs = []
-    for _d_off in range(6, -1, -1):
-        _hd  = TODAY - timedelta(days=_d_off)
-        _hk  = f'game_log/{_hd.year}/{_hd.isoformat()}.csv'
-        try:
-            _hobj = _s3c.get_object(Bucket='nrfi-store', Key=_hk)
-            _hdf  = pd.read_csv(_ioc.BytesIO(_hobj['Body'].read()))
-            _hdf['game_date'] = str(_hd)
-            _hist_dfs.append(_hdf)
-        except Exception:
-            pass
-    if _hist_dfs:
-        _history_combined = pd.concat(_hist_dfs, ignore_index=True)
-    else:
-        _history_combined = today_df.copy() if today_df is not None and not today_df.empty else pd.DataFrame()
-        if not _history_combined.empty:
-            _history_combined['game_date'] = str(TODAY)
-    # Merge lr_correct/nn_correct from results.csv (game logs save these as None at pick time)
-    if ytd_df is not None and not ytd_df.empty and not _history_combined.empty:
-        _res = ytd_df[['date', 'matchup', 'lr_correct', 'nn_correct']].copy()
-        _res = _res.rename(columns={'date': 'game_date'})
-        _history_combined = _history_combined.drop(columns=['lr_correct', 'nn_correct'], errors='ignore')
-        _history_combined = _history_combined.merge(_res, on=['game_date', 'matchup'], how='left')
+    if ytd_df is not None and not ytd_df.empty:
+        _cutoff = (TODAY - timedelta(days=6)).isoformat()
+        _past = ytd_df[ytd_df['date'] >= _cutoff].copy()
+        _past = _past.rename(columns={'date': 'game_date'})
+        _hist_dfs.append(_past)
+    if today_df is not None and not today_df.empty:
+        _today_chart = today_df.copy()
+        _today_chart['game_date'] = str(TODAY)
+        if 'lr_threshold_low' not in _today_chart.columns:
+            _today_chart['lr_threshold_low']  = LOW
+            _today_chart['lr_threshold_high'] = HIGH
+        if 'nn_threshold_low' not in _today_chart.columns:
+            _today_chart['nn_threshold_low']  = nn_low
+            _today_chart['nn_threshold_high'] = nn_high
+        _hist_dfs.append(_today_chart)
+    _history_combined = pd.concat(_hist_dfs, ignore_index=True) if _hist_dfs else pd.DataFrame()
     _chart_bytes = build_threshold_timeline(_history_combined)
 except Exception as _chart_ex:
     print(f'  WARNING: chart generation failed ({_chart_ex})')
