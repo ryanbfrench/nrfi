@@ -6,6 +6,7 @@ on:
     paths:
       - 'daily_picks.py'
       - 'lambda_function.py'
+      - 'utils/**'
   workflow_dispatch:
 
 permissions:
@@ -27,6 +28,7 @@ jobs:
       - name: Upload code to S3
         run: |
           aws s3 cp daily_picks.py s3://nrfi-store/scripts/daily_picks.py
+          aws s3 sync utils/ s3://nrfi-store/scripts/utils/
 
       - name: Update Lambda function
         # Dependencies are managed via a Lambda layer — only the handler is zipped here
