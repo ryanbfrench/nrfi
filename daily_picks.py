@@ -170,10 +170,11 @@ def load_data(path):
 
 # ── Weather (Open-Meteo, free, no API key required) ───────────────────────────
 def fetch_weather(abbv, target_date):
-    """Return (temp_F, rain) for a team's home stadium on target_date."""
+    """Return (temp_F, rain, source) for a team's home stadium on target_date.
+    source is 'api' when live data was fetched, 'default' when fallback values are used."""
     coords = STADIUM_COORDS.get(abbv)
     if coords is None:
-        return 65, 0
+        return 65, 0, 'default'
     lat, lon = coords
     try:
         url = (
@@ -187,9 +188,9 @@ def fetch_weather(abbv, target_date):
         data = requests.get(url, timeout=10).json()['daily']
         temp = round(data['temperature_2m_max'][0])
         rain = 1 if data['precipitation_sum'][0] > 0.5 else 0
-        return temp, rain
+        return temp, rain, 'api'
     except Exception:
-        return 65, 0
+        return 65, 0, 'default'
 
 # ── Odds scraping (The Odds API — totals_1st_1_innings) ──────────────────────
 # Market: Over/Under 0.5 first-inning runs. Over = YRFI, Under = NRFI.
@@ -575,7 +576,84 @@ def grade_yesterday():
 
     ytd_df = (combined[combined['date'] >= SEASON_START.isoformat()]
               if not combined.empty else pd.DataFrame())
+
+    _analyze_dq_outcomes(combined)
     return log_df, ytd_df
+
+
+def _analyze_dq_outcomes(df):
+    """
+    Compare model accuracy on high-data-quality vs imputed games.
+    Printed to console; only runs when dq_n_imputed column is present and
+    we have at least 20 graded LR confident picks to draw from.
+    """
+    if df.empty or 'dq_n_imputed' not in df.columns:
+        return
+
+    graded = df[
+        df['lr_confident'].fillna(False).astype(bool) &
+        df['lr_correct'].notna() &
+        df['dq_n_imputed'].notna()
+    ].copy()
+
+    if len(graded) < 20:
+        return  # not enough data yet
+
+    graded['dq_n_imputed'] = graded['dq_n_imputed'].astype(int)
+    overall_acc = graded['lr_correct'].mean()
+    n_total = len(graded)
+
+    print('\n' + '=' * 60)
+    print('DATA QUALITY OUTCOME ANALYSIS  (LR confident picks, YTD)')
+    print('=' * 60)
+    print(f'  Overall: {overall_acc:.1%} accuracy  ({n_total} graded picks)\n')
+
+    # Accuracy by imputation level
+    for label, mask in [
+        ('0 features imputed (clean)',  graded['dq_n_imputed'] == 0),
+        ('1 feature imputed',           graded['dq_n_imputed'] == 1),
+        ('2 features imputed',          graded['dq_n_imputed'] == 2),
+        ('3+ features imputed',         graded['dq_n_imputed'] >= 3),
+    ]:
+        subset = graded[mask]
+        if len(subset) < 3:
+            continue
+        acc = subset['lr_correct'].mean()
+        diff = acc - overall_acc
+        sign = '+' if diff >= 0 else ''
+        print(f'  {label:<35} n={len(subset):>3}  acc={acc:.1%}  ({sign}{diff:+.1%} vs avg)')
+
+    # Per-flag accuracy (only flags with enough data)
+    print()
+    flag_checks = [
+        ('Home RA imputed',   'dq_home_ra_imp',   True),
+        ('Away RA imputed',   'dq_away_ra_imp',   True),
+        ('Home WHIP imputed', 'dq_home_whip_imp', True),
+        ('Away WHIP imputed', 'dq_away_whip_imp', True),
+        ('Weather defaulted', 'dq_weather_src',   'default'),
+    ]
+    for label, col, imp_val in flag_checks:
+        if col not in graded.columns:
+            continue
+        imp_mask = graded[col] == imp_val
+        imp_sub  = graded[imp_mask]
+        live_sub = graded[~imp_mask]
+        if len(imp_sub) < 5:
+            continue
+        print(f'  {label:<30} imputed={imp_sub["lr_correct"].mean():.1%} (n={len(imp_sub)})'
+              f'  live={live_sub["lr_correct"].mean():.1%} (n={len(live_sub)})')
+
+    # OPS source accuracy
+    for side, col in [('Away OPS', 'dq_away_ops_src'), ('Home OPS', 'dq_home_ops_src')]:
+        if col not in graded.columns:
+            continue
+        for src in ['lineup', 'yesterday', 'team_avg', 'league']:
+            sub = graded[graded[col] == src]
+            if len(sub) < 5:
+                continue
+            print(f'  {side} src={src:<12} acc={sub["lr_correct"].mean():.1%}  (n={len(sub)})')
+
+    print()
 
 yesterday_log_df, ytd_df = grade_yesterday()
 
@@ -926,6 +1004,8 @@ except Exception as ex:
 
 def get_yrfi(abbv, split_curr, split_prev, overall, fallback=LEAGUE_YRFI):
     """
+    Return (value, source) where source is one of: 'current', 'prior', 'overall', 'league'.
+
     Before May 1: prior-year split → current split → overall → league average.
       Current-year home/away splits are based on ~6 games before May; those tiny
       samples produce extreme values (0-100%) that land 4-9 std deviations outside
@@ -933,12 +1013,16 @@ def get_yrfi(abbv, split_curr, split_prev, overall, fallback=LEAGUE_YRFI):
     After May 1: current split → prior-year split → overall → league average.
     """
     use_prior_first = TODAY < date(TODAY.year, 5, 1)
-    ordered = [split_prev, split_curr, overall] if use_prior_first else [split_curr, split_prev, overall]
-    for src in ordered:
+    ordered = (
+        [('prior', split_prev), ('current', split_curr), ('overall', overall)]
+        if use_prior_first else
+        [('current', split_curr), ('prior', split_prev), ('overall', overall)]
+    )
+    for src_name, src in ordered:
         v = src.get(abbv)
         if v is not None:
-            return v
-    return fallback
+            return v, src_name
+    return fallback, 'league'
 
 # ── 4b. Pitcher + team stats (MLB Stats API — 30/60-day rolling windows) ─────
 # Fangraphs blocked by Cloudflare; MLB Stats API supports identical date ranges
@@ -1035,11 +1119,18 @@ LEAGUE_WHIP = df['home_whip'].median()
 LEAGUE_OPS  = df['home_ops'].median()
 
 def get_pitcher_ra(name):
-    # Cap at RA_CAP to match training-data preprocessing (clip(upper=RA_CAP) at line ~859)
-    return min(PITCHER_RA.get(unidecode(name), LEAGUE_RA), RA_CAP)
+    """Return (ra, imputed). imputed=True when pitcher not found in 60-day MLB API window."""
+    cleaned = unidecode(name)
+    if cleaned in PITCHER_RA:
+        return min(PITCHER_RA[cleaned], RA_CAP), False
+    return LEAGUE_RA, True
 
 def get_pitcher_whip(name):
-    return PITCHER_WHIP.get(unidecode(name), LEAGUE_WHIP)
+    """Return (whip, imputed). imputed=True when pitcher not found in 60-day MLB API window."""
+    cleaned = unidecode(name)
+    if cleaned in PITCHER_WHIP:
+        return PITCHER_WHIP[cleaned], False
+    return LEAGUE_WHIP, True
 
 def _lineup_ops(player_names):
     """Average OPS of top-4 found batters in lineup. None if fewer than 2 found."""
@@ -1080,34 +1171,48 @@ except Exception as ex:
 
 def fetch_game_ops(game_id, away_abbv, home_abbv, away_team_id=None, home_team_id=None):
     """
-    Return (away_ops, home_ops) using the best available lineup:
-      1. Today's announced lineup (statsapi /lineups)
-      2. Yesterday's lineup for each side independently
-      3. 30-day team average OPS
+    Return (away_ops, home_ops, away_src, home_src) using the best available lineup:
+      1. Today's announced lineup → source='lineup'
+      2. Yesterday's lineup for each side independently → source='yesterday'
+      3. 30-day team average OPS → source='team_avg'
+      4. League average → source='league'
     """
     today_away, today_home = _fetch_lineup(game_id)
     away_ops = _lineup_ops(today_away)
     home_ops = _lineup_ops(today_home)
+    away_src = 'lineup' if away_ops is not None else None
+    home_src = 'lineup' if home_ops is not None else None
 
     # Fill in missing sides from yesterday's lineup
     if away_ops is None and away_team_id and away_team_id in YESTERDAY_GAME_BY_TEAM:
         yest_game_id = YESTERDAY_GAME_BY_TEAM[away_team_id]
         yest_away, yest_home = _fetch_lineup(yest_game_id)
-        # Use whichever side of yesterday's game this team was on
         away_ops = _lineup_ops(yest_away) or _lineup_ops(yest_home)
+        if away_ops is not None:
+            away_src = 'yesterday'
 
     if home_ops is None and home_team_id and home_team_id in YESTERDAY_GAME_BY_TEAM:
         yest_game_id = YESTERDAY_GAME_BY_TEAM[home_team_id]
         yest_away, yest_home = _fetch_lineup(yest_game_id)
         home_ops = _lineup_ops(yest_home) or _lineup_ops(yest_away)
+        if home_ops is not None:
+            home_src = 'yesterday'
 
-    # Final fallback: 30-day team average
+    # Final fallback: 30-day team average, then league average
     if away_ops is None:
-        away_ops = TEAM_AVG_OPS.get(away_abbv, LEAGUE_OPS)
+        team_val = TEAM_AVG_OPS.get(away_abbv)
+        if team_val is not None:
+            away_ops, away_src = team_val, 'team_avg'
+        else:
+            away_ops, away_src = LEAGUE_OPS, 'league'
     if home_ops is None:
-        home_ops = TEAM_AVG_OPS.get(home_abbv, LEAGUE_OPS)
+        team_val = TEAM_AVG_OPS.get(home_abbv)
+        if team_val is not None:
+            home_ops, home_src = team_val, 'team_avg'
+        else:
+            home_ops, home_src = LEAGUE_OPS, 'league'
 
-    return away_ops, home_ops
+    return away_ops, home_ops, away_src, home_src
 
 # ── 4c. Weather (Open-Meteo) ──────────────────────────────────────────────────
 print('Fetching weather from Open-Meteo...')
@@ -1116,7 +1221,7 @@ for g in games:
     home = g['home_abbv']
     if home not in WEATHER_CACHE:
         WEATHER_CACHE[home] = fetch_weather(home, str(TODAY))
-live_count = sum(1 for v in WEATHER_CACHE.values() if v != (65, 0))
+live_count = sum(1 for v in WEATHER_CACHE.values() if v[2] == 'api')
 print(f'  Fetched weather for {live_count}/{len(WEATHER_CACHE)} stadiums')
 
 # ── 4d. Odds (BettingPros) ────────────────────────────────────────────────────
@@ -1142,16 +1247,28 @@ for g in games:
     hp   = g['home_pitcher']
     ap   = g['away_pitcher']
 
-    home_ra   = get_pitcher_ra(hp)
-    home_whip = get_pitcher_whip(hp)
-    away_ra   = get_pitcher_ra(ap)
-    away_whip = get_pitcher_whip(ap)
-    away_ops, home_ops = fetch_game_ops(g['game_id'], away, home, g.get('away_id'), g.get('home_id'))
-    park      = PARK_FACTORS.get(home, 100)
-    temp, rain = WEATHER_CACHE.get(home, (65, 0))
+    home_ra,   home_ra_imp   = get_pitcher_ra(hp)
+    home_whip, home_whip_imp = get_pitcher_whip(hp)
+    away_ra,   away_ra_imp   = get_pitcher_ra(ap)
+    away_whip, away_whip_imp = get_pitcher_whip(ap)
+    away_ops, home_ops, away_ops_src, home_ops_src = fetch_game_ops(
+        g['game_id'], away, home, g.get('away_id'), g.get('home_id'))
+    park            = PARK_FACTORS.get(home, 100)
+    temp, rain, weather_src = WEATHER_CACHE.get(home, (65, 0, 'default'))
 
-    home_yrfi = get_yrfi(home, yrfi_home, yrfi_home_prev, yrfi_overall)
-    away_yrfi = get_yrfi(away, yrfi_away, yrfi_away_prev, yrfi_overall)
+    home_yrfi, home_yrfi_src = get_yrfi(home, yrfi_home, yrfi_home_prev, yrfi_overall)
+    away_yrfi, away_yrfi_src = get_yrfi(away, yrfi_away, yrfi_away_prev, yrfi_overall)
+
+    # Count imputed features: pitcher missing from API, OPS not from any lineup, YRFI/weather defaulted
+    _dq_n_imputed = sum([
+        home_ra_imp, away_ra_imp,
+        home_whip_imp, away_whip_imp,
+        home_ops_src in ('team_avg', 'league'),
+        away_ops_src in ('team_avg', 'league'),
+        home_yrfi_src == 'league',
+        away_yrfi_src == 'league',
+        weather_src == 'default',
+    ])
 
     rows.append({
         'matchup':                f'{away}@{home}',
@@ -1180,9 +1297,80 @@ for g in games:
         '_home_yrfi': home_yrfi,
         '_away_yrfi': away_yrfi,
         '_park':      park,
+        # data quality flags (prefix _ so they don't enter model features)
+        '_dq_home_ra_imp':   home_ra_imp,
+        '_dq_away_ra_imp':   away_ra_imp,
+        '_dq_home_whip_imp': home_whip_imp,
+        '_dq_away_whip_imp': away_whip_imp,
+        '_dq_home_ops_src':  home_ops_src,
+        '_dq_away_ops_src':  away_ops_src,
+        '_dq_home_yrfi_src': home_yrfi_src,
+        '_dq_away_yrfi_src': away_yrfi_src,
+        '_dq_weather_src':   weather_src,
+        '_dq_n_imputed':     _dq_n_imputed,
     })
 
 today_df = pd.DataFrame(rows)
+
+
+def print_data_quality_report(rows_list):
+    """Print a per-feature imputation summary for today's games."""
+    n = len(rows_list)
+    print('\n' + '=' * 60)
+    print(f'DATA QUALITY — {TODAY}  ({n} games)')
+    print('=' * 60)
+    if n == 0:
+        print('  No games.')
+        return
+
+    def _pct(cnt): return f'{cnt}/{n} ({cnt/n:.0%})'
+
+    # Pitcher RA / WHIP
+    for label, col in [
+        ('Home starter RA',   '_dq_home_ra_imp'),
+        ('Away starter RA',   '_dq_away_ra_imp'),
+        ('Home starter WHIP', '_dq_home_whip_imp'),
+        ('Away starter WHIP', '_dq_away_whip_imp'),
+    ]:
+        cnt = sum(1 for r in rows_list if r.get(col, False))
+        flag = '  *** TBD starters' if cnt == n else ''
+        print(f'  {label:<22} imputed: {_pct(cnt)}{flag}')
+
+    # OPS source breakdown
+    for label, col in [('Away OPS', '_dq_away_ops_src'), ('Home OPS', '_dq_home_ops_src')]:
+        counts = {}
+        for r in rows_list:
+            src = r.get(col, 'unknown')
+            counts[src] = counts.get(src, 0) + 1
+        src_str = '  '.join(f'{k}={v}' for k, v in
+                            sorted(counts.items(), key=lambda x: ['lineup','yesterday','team_avg','league','unknown'].index(x[0])
+                                   if x[0] in ['lineup','yesterday','team_avg','league','unknown'] else 99))
+        print(f'  {label:<22} {src_str}')
+
+    # YRFI% source breakdown
+    for label, col in [('Home YRFI%', '_dq_home_yrfi_src'), ('Away YRFI%', '_dq_away_yrfi_src')]:
+        counts = {}
+        for r in rows_list:
+            src = r.get(col, 'unknown')
+            counts[src] = counts.get(src, 0) + 1
+        src_str = '  '.join(f'{k}={v}' for k, v in
+                            sorted(counts.items(), key=lambda x: ['current','prior','overall','league','unknown'].index(x[0])
+                                   if x[0] in ['current','prior','overall','league','unknown'] else 99))
+        print(f'  {label:<22} {src_str}')
+
+    # Weather
+    api_cnt = sum(1 for r in rows_list if r.get('_dq_weather_src') == 'api')
+    print(f'  {"Weather":<22} api={api_cnt}  default={n - api_cnt}')
+
+    # High-imputation games
+    high_imp = [r['matchup'] for r in rows_list if r.get('_dq_n_imputed', 0) >= 3]
+    if high_imp:
+        print(f'\n  *** High-imputation (>=3 features): {", ".join(high_imp)}')
+        print(f'      Predictions for these games lean heavily on league averages.')
+    print()
+
+
+print_data_quality_report(rows)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 6 — APPLY MODELS
@@ -1394,6 +1582,17 @@ def save_game_log(df, date_str, lr_threshold, nn_threshold_low, nn_threshold_hig
             'park_factor':        r['_park'],
             'temp':               r['_temp'],
             'rain':               int(r['_rain']),
+            # Data quality flags
+            'dq_home_ra_imp':     bool(r.get('_dq_home_ra_imp', False)),
+            'dq_away_ra_imp':     bool(r.get('_dq_away_ra_imp', False)),
+            'dq_home_whip_imp':   bool(r.get('_dq_home_whip_imp', False)),
+            'dq_away_whip_imp':   bool(r.get('_dq_away_whip_imp', False)),
+            'dq_home_ops_src':    r.get('_dq_home_ops_src', 'unknown'),
+            'dq_away_ops_src':    r.get('_dq_away_ops_src', 'unknown'),
+            'dq_home_yrfi_src':   r.get('_dq_home_yrfi_src', 'unknown'),
+            'dq_away_yrfi_src':   r.get('_dq_away_yrfi_src', 'unknown'),
+            'dq_weather_src':     r.get('_dq_weather_src', 'unknown'),
+            'dq_n_imputed':       int(r.get('_dq_n_imputed', 0)),
             # Actuals (filled in next day by grade_yesterday)
             'actual_yrfi':        None,
             'lr_correct':         None,
@@ -1493,13 +1692,34 @@ email_html = build_email_html(
     get_odds_fn=get_odds,
 )
 
-# Build 7-day confidence band timeline chart for email
-# Use ytd_df (already loaded from results.csv) + today_df — avoids separate S3 reads
-# and ensures the chart has data even if individual game_log files don't yet exist.
+# Build 7-day confidence band timeline chart for email.
+# Load the past 6 game_log CSVs directly from S3 — these are written unconditionally
+# by save_game_log() and exist even when Lambda results are absent (which would cause
+# grade_yesterday() to return ytd_df=None, leaving the chart with only 1 day of data).
 _chart_bytes = None
 try:
     _hist_dfs = []
-    if ytd_df is not None and not ytd_df.empty:
+    _s3_bucket_chart = os.environ.get('NRFI_OUTPUT_BUCKET')
+    _loaded_from_s3 = False
+    if _s3_bucket_chart:
+        try:
+            import boto3 as _boto3c, io as _cioc
+            _cs3 = _boto3c.client('s3')
+            for _d_offset in range(1, 7):
+                _d = TODAY - timedelta(days=_d_offset)
+                _gl_key = f'game_log/{_d.year}/{_d.isoformat()}.csv'
+                try:
+                    _obj = _cs3.get_object(Bucket=_s3_bucket_chart, Key=_gl_key)
+                    _ddf = pd.read_csv(_cioc.BytesIO(_obj['Body'].read()))
+                    if not _ddf.empty:
+                        _ddf = _ddf.rename(columns={'date': 'game_date'})
+                        _hist_dfs.append(_ddf)
+                        _loaded_from_s3 = True
+                except Exception:
+                    pass  # day missing or no data — skip
+        except Exception as _s3_chart_ex:
+            print(f'  WARNING: chart history S3 load failed ({_s3_chart_ex})')
+    if not _loaded_from_s3 and ytd_df is not None and not ytd_df.empty:
         _cutoff = (TODAY - timedelta(days=6)).isoformat()
         _past = ytd_df[ytd_df['date'] >= _cutoff].copy()
         _past = _past.rename(columns={'date': 'game_date'})
