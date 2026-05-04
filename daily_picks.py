@@ -1735,6 +1735,18 @@ try:
             _today_chart['nn_threshold_high'] = nn_high
         _hist_dfs.append(_today_chart)
     _history_combined = pd.concat(_hist_dfs, ignore_index=True) if _hist_dfs else pd.DataFrame()
+
+    # game_log CSVs have lr_correct=None; merge actuals from ytd_df so past dots show green/red.
+    if ytd_df is not None and not ytd_df.empty and not _history_combined.empty:
+        _ytd_outcomes = (ytd_df[['date', 'matchup', 'lr_correct', 'nn_correct']]
+                         .rename(columns={'date': 'game_date'}))
+        for _col in ['lr_correct', 'nn_correct']:
+            if _col in _history_combined.columns:
+                _history_combined = _history_combined.drop(columns=[_col])
+        _history_combined = _history_combined.merge(
+            _ytd_outcomes, on=['game_date', 'matchup'], how='left'
+        )
+
     _chart_bytes = build_threshold_timeline(_history_combined)
 except Exception as _chart_ex:
     print(f'  WARNING: chart generation failed ({_chart_ex})')
