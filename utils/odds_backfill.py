@@ -27,7 +27,7 @@ import requests
 
 EVENTS_URL     = 'https://api.the-odds-api.com/v4/historical/sports/baseball_mlb/events'
 ODDS_URL       = 'https://api.the-odds-api.com/v4/historical/sports/baseball_mlb/events/{event_id}/odds'
-SNAPSHOT_HOUR  = '14:00:00Z'   # morning lines — consistent with backfill_odds_2025.py
+SNAPSHOT_HOUR  = '18:00:00Z'   # 2pm ET — lines reliably posted for all games by this time
 STOP_THRESHOLD = 200            # abort if remaining quota drops below this
 SLEEP_BETWEEN  = 1.0            # seconds between API calls
 
@@ -54,11 +54,12 @@ def _s3_key(date_str):
 
 
 def _load_cached(s3_client, bucket, date_str):
-    """Load cached events list from S3. Returns list or None if not cached."""
+    """Load cached events list from S3. Returns non-empty list, or None if not cached / empty."""
     try:
         import io
         obj = s3_client.get_object(Bucket=bucket, Key=_s3_key(date_str))
-        return json.loads(obj['Body'].read())
+        data = json.loads(obj['Body'].read())
+        return data if data else None  # treat empty cache as missing so historical API is retried
     except Exception:
         return None
 

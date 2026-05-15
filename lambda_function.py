@@ -209,31 +209,58 @@ def main():
     except Exception as e:
         print(f'Could not load WHIP df: {e}')
 
-    payload = {
+    # ── Pitcher first-inning RA ───────────────────────────────────────────────
+    # Primary: Fangraphs split code 44 (1st inning). If it returns data, use it.
+    # Fallback: statsapi linescore accumulation in S3 (ground-truth, always current).
+    # The S3 accumulation is updated every run regardless of which source is used.
+
+    # Primary: Fangraphs
+    pitcher_runs_df = None
+    _fg_payload = {
         'strPlayerId': 'all', 'strSplitArr': [44], 'strGroup': 'season',
         'strPosition': 'P', 'strType': '1',
         'strStartDate': str(season_start_date), 'strEndDate': str(yesterday),
-        'strSplitTeams': False,
-        'dctFilters': [],
-        'strStatType': 'player', 'strAutoPt': 'true', 'arrPlayerId': [],
-        'strSplitArrPitch': [], 'arrWxTemperature': None, 'arrWxPressure': None,
+        'strSplitTeams': False, 'dctFilters': [], 'strStatType': 'player',
+        'strAutoPt': 'true', 'arrPlayerId': [], 'strSplitArrPitch': [],
+        'arrWxTemperature': None, 'arrWxPressure': None,
         'arrWxAirDensity': None, 'arrWxElevation': None, 'arrWxWindSpeed': None,
     }
-    pitcher_runs_df = None
     try:
-        r = requests.post(
+        _r = requests.post(
             'https://www.fangraphs.com/api/leaders/splits/splits-leaders',
-            json=payload, timeout=30
+            json=_fg_payload, timeout=30,
         )
-        _pdf = pd.json_normalize(r.json()['data'])
-        if 'R' in _pdf.columns and 'G' in _pdf.columns and 'playerName' in _pdf.columns:
+        _pdf = pd.json_normalize(_r.json()['data'])
+        if 'R' in _pdf.columns and 'G' in _pdf.columns and 'playerName' in _pdf.columns and len(_pdf) > 50:
             _pdf['RA'] = _pdf['R'] / _pdf['G']
             _pdf['cleanedName'] = _pdf['playerName'].apply(unidecode)
             pitcher_runs_df = _pdf
+            print(f'Fangraphs 1st-inn split: {len(_pdf)} pitchers')
         else:
-            print(f'Pitcher runs df missing expected columns: {list(_pdf.columns[:10])}')
-    except Exception as e:
-        print(f'Could not load pitcher runs df: {e}')
+            print(f'Fangraphs split returned {len(_pdf)} rows — using linescore fallback')
+    except Exception as _e:
+        print(f'Fangraphs split unavailable ({_e}) — using linescore fallback')
+
+    # Fallback: linescore accumulation from S3
+    # Also always loaded so the accumulation stays current even when Fangraphs is up.
+    # S3 key: pitcher_ra/{year}.json — {str(personId): {"R": int, "G": int}, "_last_date": str}
+    s3_client = boto3.client('s3', region_name='us-east-1')
+    _ra_s3_key = f'pitcher_ra/{y}.json'
+    _ra_raw = {}           # str(personId) -> {'R': int, 'G': int}
+    pitcher_ra_by_id = {}  # int(personId) -> float RA
+    try:
+        _obj = s3_client.get_object(Bucket='nrfi-store', Key=_ra_s3_key)
+        _ra_raw = json.loads(_obj['Body'].read().decode('utf-8'))
+        _ra_raw.pop('_last_date', None)
+        pitcher_ra_by_id = {
+            int(pid): s['R'] / s['G']
+            for pid, s in _ra_raw.items()
+            if s.get('G', 0) > 0
+        }
+        print(f'Linescore RA loaded: {len(pitcher_ra_by_id)} pitchers from S3')
+    except Exception as _e:
+        print(f'S3 linescore RA unavailable ({_e}) — run utils/backfill_pitcher_ra.py')
+    pitcher_ra_updates = {}  # str(personId) -> {'R': int, 'G': int} for yesterday's games
 
     team_pct = pd.read_html(
         f'https://www.teamrankings.com/mlb/stat/yes-run-first-inning-pct?date={yesterday}'
@@ -280,14 +307,27 @@ def main():
             print(f'  Skipping {row_id}: pitcher data not available')
             ids_seen.remove(row_id)
             continue
-        away_pitcher = api_name(boxscore['awayPitchers'][1]['personId'])
-        home_pitcher = api_name(boxscore['homePitchers'][1]['personId'])
+        away_pid = boxscore['awayPitchers'][1]['personId']
+        home_pid = boxscore['homePitchers'][1]['personId']
+        away_pitcher = api_name(away_pid)
+        home_pitcher = api_name(home_pid)
 
-        if pitcher_runs_df is not None:
-            away_ra = get_pitcher_ra(away_pitcher, pitcher_runs_df)
-            home_ra = get_pitcher_ra(home_pitcher, pitcher_runs_df)
-        else:
-            away_ra = home_ra = None
+        # RA lookup: Fangraphs primary, linescore accumulation per-pitcher fallback
+        away_ra = get_pitcher_ra(away_pitcher, pitcher_runs_df) if pitcher_runs_df is not None else None
+        if away_ra is None:
+            away_ra = pitcher_ra_by_id.get(away_pid)
+        home_ra = get_pitcher_ra(home_pitcher, pitcher_runs_df) if pitcher_runs_df is not None else None
+        if home_ra is None:
+            home_ra = pitcher_ra_by_id.get(home_pid)
+
+        # Accumulate yesterday's first-inning runs for the linescore fallback.
+        # Home starter faces away batters in the TOP of the 1st → top1 is their runs allowed.
+        # Away starter faces home batters in the BOTTOM of the 1st → bot1 is their runs allowed.
+        for _pid, _r in [(str(home_pid), top1), (str(away_pid), bot1)]:
+            if _pid not in pitcher_ra_updates:
+                pitcher_ra_updates[_pid] = {'R': 0, 'G': 0}
+            pitcher_ra_updates[_pid]['R'] += _r
+            pitcher_ra_updates[_pid]['G'] += 1
 
         away_whip = get_whip(away_pitcher, whip_df) if whip_df is not None else None
         home_whip = get_whip(home_pitcher, whip_df) if whip_df is not None else None
@@ -330,6 +370,23 @@ def main():
             'rain':            rain,
             'dome':            dome,
         })
+
+    # Merge yesterday's first-inning pitcher stats into S3 accumulation
+    for _pid, _upd in pitcher_ra_updates.items():
+        if _pid not in _ra_raw:
+            _ra_raw[_pid] = {'R': 0, 'G': 0}
+        _ra_raw[_pid]['R'] += _upd['R']
+        _ra_raw[_pid]['G'] += _upd['G']
+    _ra_raw['_last_date'] = str(yesterday)
+    try:
+        s3_client.put_object(
+            Bucket='nrfi-store', Key=_ra_s3_key,
+            Body=json.dumps(_ra_raw).encode('utf-8'),
+            ContentType='application/json',
+        )
+        print(f'Saved first-inn pitcher RA ({len(_ra_raw) - 1} pitchers) to S3')
+    except Exception as _e:
+        print(f'Warning: could not save pitcher RA to S3 ({_e})')
 
     big_df = pd.DataFrame(day_rows).reset_index(drop=True)
     return big_df, yesterday

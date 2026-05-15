@@ -795,29 +795,40 @@ if nn is not None:
                           f'{YESTERDAY.month}/{YESTERDAY.day}.txt')
         try:
             batch_df = load_data(yesterday_path)
-            for col in ['away_pitcher_ra', 'home_pitcher_ra', 'away_whip', 'home_whip',
-                        'home_yrfi_pct', 'away_yrfi_pct']:
-                batch_df[col] = batch_df[col].replace(0, df[col].median())
-                batch_df[col] = batch_df[col].fillna(df[col].median())
-            # Apply same preprocessing as training data (RA cap, whip cap)
-            for col in ['away_pitcher_ra', 'home_pitcher_ra']:
-                batch_df[col] = batch_df[col].clip(upper=RA_CAP)
-            feat_batch = make_features(batch_df)
-            # drop rows with any NaN features to prevent weight explosion
-            valid_mask = feat_batch.notna().all(axis=1)
-            feat_batch = feat_batch[valid_mask]
-            y_batch = batch_df['YRFI'].values[valid_mask]
-            if len(feat_batch) == 0:
-                print(f'  WARNING: batch has no clean rows after NaN drop — skipping increment')
+            # Quality gate: if pitcher RA is missing for most games, the lambda's
+            # RA source failed. Training on fully-imputed RA destroys feature variance
+            # and causes the NN to drift toward a constant output over multiple days.
+            _ra_null_rate = batch_df[['away_pitcher_ra', 'home_pitcher_ra']].isna().values.mean()
+            if _ra_null_rate > 0.5:
+                print(f'  WARNING: {_ra_null_rate:.0%} of pitcher RA values are null in batch '
+                      f'({YESTERDAY}) — skipping increment to prevent feature collapse')
+                _save_nn_to_s3(nn, NN_MODEL_PATH)
+                print(f'  NN saved to {NN_MODEL_PATH} (unchanged)')
             else:
-                X_batch = nn_scaler.transform(feat_batch.values)
-                nn.fit(X_batch, y_batch, epochs=5, batch_size=64, verbose=0)
-                print(f'  Incremental train: 5 epochs on {len(feat_batch)} games from {YESTERDAY}')
+                for col in ['away_pitcher_ra', 'home_pitcher_ra', 'away_whip', 'home_whip',
+                            'home_yrfi_pct', 'away_yrfi_pct']:
+                    batch_df[col] = batch_df[col].replace(0, df[col].median())
+                    batch_df[col] = batch_df[col].fillna(df[col].median())
+                # Apply same preprocessing as training data (RA cap, whip cap)
+                for col in ['away_pitcher_ra', 'home_pitcher_ra']:
+                    batch_df[col] = batch_df[col].clip(upper=RA_CAP)
+                feat_batch = make_features(batch_df)
+                # drop rows with any NaN features to prevent weight explosion
+                valid_mask = feat_batch.notna().all(axis=1)
+                feat_batch = feat_batch[valid_mask]
+                y_batch = batch_df['YRFI'].values[valid_mask]
+                if len(feat_batch) == 0:
+                    print(f'  WARNING: batch has no clean rows after NaN drop — skipping increment')
+                else:
+                    X_batch = nn_scaler.transform(feat_batch.values)
+                    nn.fit(X_batch, y_batch, epochs=5, batch_size=64, verbose=0)
+                    print(f'  Incremental train: 5 epochs on {len(feat_batch)} games from {YESTERDAY}')
+                _save_nn_to_s3(nn, NN_MODEL_PATH)
+                print(f'  NN saved to {NN_MODEL_PATH}')
         except Exception as ex:
             print(f'  WARNING: could not load yesterday batch ({ex}) — skipping increment')
-
-        _save_nn_to_s3(nn, NN_MODEL_PATH)
-        print(f'  NN saved to {NN_MODEL_PATH}')
+            _save_nn_to_s3(nn, NN_MODEL_PATH)
+            print(f'  NN saved to {NN_MODEL_PATH} (unchanged)')
 else:
     print('\nNo saved NN found — training from scratch on full dataset...')
     nn = _build_nn(X_nn_all.shape[1])
