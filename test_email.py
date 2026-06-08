@@ -106,12 +106,14 @@ history_combined = pd.concat(chart_dfs, ignore_index=True) if chart_dfs else pd.
 chart_bytes = build_threshold_timeline(history_combined)
 print(f'Chart: {len(chart_bytes) if chart_bytes else 0} bytes')
 
-# ── Pull today's threshold from game log (most recent cv_* columns) ───────────
-lr_threshold = 0.550; nn_threshold = 0.550
-cv_acc = 0.0;         cv_cov = 0.0
+# ── Pull today's band from game log (boundary ± margin, stored as low/high) ───
+lr_band = (0.450, 0.550); nn_band = (0.450, 0.550)
+cv_acc = 0.0;             cv_cov = 0.0
 if not today_df.empty and 'lr_threshold_high' in today_df.columns:
-    lr_threshold = float(today_df['lr_threshold_high'].iloc[0])
-    nn_threshold = float(today_df.get('nn_threshold_high', today_df['lr_threshold_high']).iloc[0])
+    lr_band = (float(today_df['lr_threshold_low'].iloc[0]),
+               float(today_df['lr_threshold_high'].iloc[0]))
+    nn_band = (float(today_df.get('nn_threshold_low', today_df['lr_threshold_low']).iloc[0]),
+               float(today_df.get('nn_threshold_high', today_df['lr_threshold_high']).iloc[0]))
 if not today_df.empty and 'cv_acc' in today_df.columns:
     cv_acc = float(today_df['cv_acc'].iloc[0])
     cv_cov = float(today_df['cv_cov'].iloc[0])
@@ -123,8 +125,8 @@ email_html = build_email_html(
     yesterday_rows=yest_df if not yest_df.empty else None,
     ytd_df=ytd_df if not ytd_df.empty else None,
     today_df_all=today_df if not today_df.empty else None,
-    lr_threshold=lr_threshold,
-    nn_threshold=nn_threshold,
+    lr_band=lr_band,
+    nn_band=nn_band,
     cv_acc=cv_acc,
     cv_cov=cv_cov,
     yesterday=YESTERDAY,

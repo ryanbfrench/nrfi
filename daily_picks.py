@@ -79,7 +79,8 @@ tf.random.set_seed(42)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_PATH      = os.environ.get('NRFI_DATA_PATH',     'data/NRFI_all.csv')
-NN_MODEL_PATH  = os.environ.get('NRFI_NN_MODEL_PATH', 's3://nrfi-store/models/nn_model.keras')
+# Weights-only numpy persistence (see _save_nn_to_s3). Default key is .npz; the old .keras full-model file is abandoned (version-fragile). A path override is stored as whatever bytes we write regardless of extension.
+NN_MODEL_PATH  = os.environ.get('NRFI_NN_MODEL_PATH', 's3://nrfi-store/models/nn_weights.npz')
 SESSION        = os.environ.get('SESSION', 'all')   # 'afternoon' | 'evening' | 'all'
 TODAY          = date.today()
 YESTERDAY      = TODAY - timedelta(days=1)
@@ -89,9 +90,19 @@ SEASON_START   = date(2026, 4, 15)   # first date counted in YTD stats — based
 AFTERNOON_CUTOFF_UTC_HOUR = 21
 MIN_COVERAGE       = 0.10
 MAX_COVERAGE       = 0.15
+# NN confidence band is set by PERCENTILE of recent NN outputs (rolling window), not a fixed CV margin (2026-06-07). A margin tuned on historical CV undershot deployment coverage badly (2.8% vs 15% target) because the live output distribution is shifted/ compressed. Percentile calibration on a recent window hits the coverage target on the distribution actually being scored. See DECISIONS.md 2026-06-07.
+NN_COVERAGE_TARGET = 0.15   # fraction of games to flag confident (split across both tails)
+NN_POOL_DAYS       = 45     # rolling window of recent game_logs to calibrate the band
+NN_POOL_MIN        = 100    # min pooled outputs required; else fall back to margin band
 UNIT               = 10    # dollars per unit
 HIST_ODDS_API_KEY  = os.environ.get('HISTORICAL_ODDS_API_KEY')
 RECENCY_HALF_LIFE  = 365   # days; games 1yr old carry ~37% weight, 2yr ~14%, 3yr ~5%
+
+# Online (incremental) NN update — methods A + B + C (see _incremental_update):   A streaming SGD,  B experience replay,  C L2-SP anchor to previous weights.
+NN_ONLINE_LR       = 3e-4  # A: low LR — each daily batch nudges weights only slightly
+NN_ONLINE_MOMENTUM = 0.9   # A: SGD momentum
+NN_REPLAY_N        = 256   # B: games sampled UNIFORMLY from all history per update
+NN_L2SP_LAMBDA     = 1e-3  # C: strength of the anchor toward pre-update weights
 
 # Park factors (2025 — update at start of each season)
 PARK_FACTORS = {
@@ -193,9 +204,7 @@ def fetch_weather(abbv, target_date):
         return 65, 0, 'default'
 
 # ── Odds scraping (The Odds API — totals_1st_1_innings) ──────────────────────
-# Market: Over/Under 0.5 first-inning runs. Over = YRFI, Under = NRFI.
-# Free tier: 500 requests/month. ~15 games/day ≈ 450 requests/month.
-# Env var: ODDS_API_KEY
+# Market: Over/Under 0.5 first-inning runs. Over = YRFI, Under = NRFI. Free tier: 500 requests/month. ~15 games/day ≈ 450 requests/month. Env var: ODDS_API_KEY
 
 _ODDS_API_TEAM_MAP = {
     'arizona diamondbacks': 'ARI', 'atlanta braves': 'ATL', 'baltimore orioles': 'BAL',
@@ -294,8 +303,7 @@ def fetch_odds():
         print(f'  WARNING: Odds API fetch failed ({ex}) — trying Bovada fallback')
         return _fetch_odds_bovada_fallback()
 
-    # Save raw snapshot to S3 — same path/format as backfill_odds_2025.py
-    # s3://nrfi-store/odds/{year}/{date}.json
+    # Save raw snapshot to S3 — same path/format as backfill_odds_2025.py s3://nrfi-store/odds/{year}/{date}.json
     if raw_events:
         _odds_s3_key = f'odds/{TODAY.year}/{TODAY.isoformat()}.json'
         try:
@@ -365,11 +373,11 @@ def _fetch_odds_bovada_fallback():
     return odds
 
 # ── Output delivery (SNS + S3 JSON) ──────────────────────────────────────────
-def deliver_picks(picks_rows, date_str, threshold, cv_acc, cv_cov):
+def deliver_picks(picks_rows, date_str, band_low, band_high, cv_acc, cv_cov):
     """Write picks JSON to S3 and/or publish to SNS if env vars are configured."""
     payload = {
         'date':      date_str,
-        'threshold': {'low': round(1 - threshold, 3), 'high': threshold},
+        'threshold': {'low': round(band_low, 3), 'high': round(band_high, 3)},
         'cv_acc':    round(cv_acc, 4),
         'cv_cov':    round(cv_cov, 4),
         'picks':     picks_rows,
@@ -666,9 +674,7 @@ print('=' * 60)
 
 _df_raw = load_data(DATA_PATH)
 
-# Exclude pre-April-15 games from training: pitcher RA and YRFI pct are
-# unreliable before mid-April (Fangraphs splits need innings to accumulate;
-# teamrankings YRFI% is based on 0-2 games and often reads as 0%).
+# Exclude pre-April-15 games from training: pitcher RA and YRFI pct are unreliable before mid-April (Fangraphs splits need innings to accumulate; teamrankings YRFI% is based on 0-2 games and often reads as 0%).
 df = _df_raw[~((_df_raw['month'] < 4) | ((_df_raw['month'] == 4) & (_df_raw['day'] < 15)))].copy()
 print(f'Training set after April-15 filter: {len(df)} games '
       f'(dropped {len(_df_raw) - len(df)} pre-Apr-15 rows)')
@@ -730,39 +736,131 @@ def _s3_model_exists(s3_path):
     except Exception:
         return False
 
-def _load_nn_from_s3(s3_path):
-    import boto3
+def _load_nn_from_s3(s3_path, input_dim):
+    """Rebuild the architecture from _build_nn and load WEIGHTS ONLY (plain numpy).
+
+    We deliberately do NOT use tf.keras.models.load_model: full-model serialization
+    embeds the architecture config, whose schema changed between Keras 2 and 3
+    (InputLayer 'batch_input_shape' -> 'batch_shape'), so a model saved in one env
+    fails to load in another and silently falls back to scratch-retraining -- meaning
+    the incremental A+B+C updates never actually persist. get_weights/set_weights round
+    a flat list of numpy arrays, which is version-independent as long as the layer shapes
+    from _build_nn match (they're deterministic here)."""
+    import boto3, io
     bucket, key = s3_path[5:].split('/', 1)
-    with tempfile.NamedTemporaryFile(suffix='.keras', delete=False) as f:
-        boto3.client('s3').download_fileobj(bucket, key, f)
-        return tf.keras.models.load_model(f.name)
+    obj  = boto3.client('s3').get_object(Bucket=bucket, Key=key)
+    data = np.load(io.BytesIO(obj['Body'].read()), allow_pickle=False)
+    weights = [data[f'arr_{i}'] for i in range(len(data.files))]
+    model = _build_nn(input_dim)
+    model.set_weights(weights)
+    return model
 
 def _save_nn_to_s3(model, s3_path):
+    """Save WEIGHTS ONLY as a numpy .npz (see _load_nn_from_s3 for why not load_model)."""
     try:
-        import boto3
+        import boto3, io
         bucket, key = s3_path[5:].split('/', 1)
-        with tempfile.NamedTemporaryFile(suffix='.keras', delete=False) as f:
-            model.save(f.name)
-            boto3.client('s3').upload_file(f.name, bucket, key)
+        buf = io.BytesIO()
+        np.savez(buf, *model.get_weights())
+        boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
     except Exception as ex:
         print(f'  WARNING: could not save NN to S3 ({ex})')
 
+def _recent_nn_pool(end_date, n_days):
+    """Pool `nn_prob_yrfi` from the last `n_days` of game_logs ending before `end_date`.
+    Used to calibrate the NN confidence band by percentile on the live output
+    distribution. The NN evolves slowly (boundary drifts ~3e-4/day under the L2-SP
+    anchored incremental update), so stored outputs from recent days are a faithful
+    proxy for the current model's distribution. Returns a 1-D np.array (possibly empty)."""
+    bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
+    if not bucket:
+        return np.array([])
+    import boto3, io
+    s3 = boto3.client('s3')
+    probs = []
+    for i in range(1, n_days + 1):
+        d = end_date - timedelta(days=i)
+        key = f'game_log/{d.year}/{d.isoformat()}.csv'
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            gl  = pd.read_csv(io.BytesIO(obj['Body'].read()))
+            if 'nn_prob_yrfi' in gl.columns:
+                probs.append(pd.to_numeric(gl['nn_prob_yrfi'], errors='coerce').dropna().values)
+        except Exception:
+            continue
+    return np.concatenate(probs) if probs else np.array([])
+
 def _build_nn(input_dim):
-    """Best architecture from hyperparam gridsearch (Apr 2026): 8->8->8->1, dropout=0.1, lr=0.005, bs=64, l2=0.001.
-    Trained on 2021-2025 data: conf_acc=54.2%, coverage=39.0%, edge=0.0163."""
-    reg = tf.keras.regularizers.l2(0.001)
+    """8->8->8->1, lr=0.005, bs=64.  Regularization dialed back to l2=1e-5, dropout=0
+    (2026-06-07): the prior l2=1e-3 on all three layers compressed the sigmoid output
+    asymmetrically -- floor ~0.495, no left tail -- so the NN could NEVER produce a
+    confident NRFI pick (0% below the NRFI band on train AND 2026 data). Light reg
+    restores a symmetric ~25% NRFI tail (std~0.038) matching the LR. The kernel
+    regularizer only affects the from-scratch fit; the incremental update applies its
+    own L2-SP anchor in a custom loop, so this change is safe for daily stability."""
+    reg = tf.keras.regularizers.l2(1e-5)
     model = tf.keras.Sequential([
         tf.keras.layers.Dense(8, activation='relu', input_shape=(input_dim,), kernel_regularizer=reg),
-        tf.keras.layers.Dropout(0.1),
+        tf.keras.layers.Dropout(0.0),
         tf.keras.layers.Dense(8, activation='relu', kernel_regularizer=reg),
-        tf.keras.layers.Dropout(0.1),
+        tf.keras.layers.Dropout(0.0),
         tf.keras.layers.Dense(8, activation='relu', kernel_regularizer=reg),
-        tf.keras.layers.Dropout(0.1),
+        tf.keras.layers.Dropout(0.0),
         tf.keras.layers.Dense(1, activation='sigmoid'),
     ])
     model.compile(optimizer=tf.keras.optimizers.Adam(0.005),
                   loss='binary_crossentropy')
     return model
+
+def _incremental_update(model, X_new, y_new, X_hist, y_hist, *,
+                        replay_n=NN_REPLAY_N, lr=NN_ONLINE_LR,
+                        momentum=NN_ONLINE_MOMENTUM, l2sp=NN_L2SP_LAMBDA,
+                        epochs=1, seed=None):
+    """Stable online NN update — methods A + B + C.
+
+      A (streaming SGD): a single epoch of SGD+momentum at a low LR, so the day's
+        batch nudges the weights only slightly — a true online step, not the old
+        5-epoch refit that memorized each day's ~15 games.
+      B (experience replay): mix the new games with `replay_n` games sampled
+        UNIFORMLY from all history, so every update keeps re-seeing the full
+        distribution and cannot drift toward a constant output.
+      C (L2-SP): penalize ||w - w_prev||^2 — anchor to the PRE-UPDATE weights —
+        instead of ||w||^2. The model stays near what it already knew rather than
+        decaying toward zero (the original collapse driver).
+
+    Trains the model in place. Deliberately excludes the model's baked-in
+    l2(->0) kernel regularizers (`model.losses`) so only the L2-SP anchor acts
+    during the increment. Returns the number of rows trained on.
+    """
+    rng = np.random.default_rng(seed)
+    if replay_n and len(y_hist) > 0:
+        idx   = rng.choice(len(y_hist), size=min(replay_n, len(y_hist)), replace=False)
+        X_mix = np.concatenate([X_hist[idx], X_new], axis=0)
+        y_mix = np.concatenate([np.asarray(y_hist)[idx], np.asarray(y_new)], axis=0)
+    else:
+        X_mix, y_mix = X_new, np.asarray(y_new)
+
+    X_t = tf.constant(X_mix, dtype=tf.float32)
+    y_t = tf.constant(y_mix.reshape(-1, 1), dtype=tf.float32)
+
+    kernels = [v for v in model.trainable_variables if 'kernel' in v.name]
+    anchors = [tf.constant(k.numpy()) for k in kernels]   # C: w_prev snapshot
+
+    opt = tf.keras.optimizers.SGD(learning_rate=lr, momentum=momentum)
+    bce = tf.keras.losses.BinaryCrossentropy()
+    n, bs = int(X_t.shape[0]), 64
+    for _ in range(epochs):
+        perm = tf.random.shuffle(tf.range(n))
+        for s in range(0, n, bs):
+            b      = perm[s:s + bs]
+            xb, yb = tf.gather(X_t, b), tf.gather(y_t, b)
+            with tf.GradientTape() as tape:
+                loss = bce(yb, model(xb, training=True))
+                loss = loss + l2sp * tf.add_n(
+                    [tf.reduce_sum(tf.square(k - a)) for k, a in zip(kernels, anchors)])
+            grads = tape.gradient(loss, model.trainable_variables)
+            opt.apply_gradients(zip(grads, model.trainable_variables))
+    return n
 
 nn_scaler = StandardScaler()
 X_nn_all  = nn_scaler.fit_transform(X_raw)
@@ -774,7 +872,8 @@ nn = None
 if uses_s3 and _s3_model_exists(NN_MODEL_PATH):
     print(f'\nLoading NN from {NN_MODEL_PATH}...')
     try:
-        nn = _load_nn_from_s3(NN_MODEL_PATH)
+        nn = _load_nn_from_s3(NN_MODEL_PATH, X_nn_all.shape[1])
+        print('  Loaded NN weights (incremental state preserved)')
     except Exception as _load_err:
         print(f'  WARNING: could not load saved NN ({_load_err}) — will retrain from scratch')
         nn = None
@@ -782,26 +881,25 @@ if uses_s3 and _s3_model_exists(NN_MODEL_PATH):
 if nn is not None:
     _NN_SEASON_START = date(TODAY.year, 5, 1)
     if YESTERDAY < _NN_SEASON_START:
-        # Early-season freeze: pitcher RA and YRFI splits are unreliable before May 1
-        # (tiny sample sizes create extreme feature values that are OOD vs training data).
-        # Also, the lambda saves RA as R/G vs training R/IP — wrong scale before this is resolved.
-        # Skip the increment entirely; save model unchanged so weights don't drift.
+        # Early-season freeze: pitcher RA and YRFI splits are unreliable before May 1 (tiny sample sizes create extreme feature values that are OOD vs training data). Also, the lambda saves RA as R/G vs training R/IP — wrong scale before this is resolved. Skip the increment entirely; save model unchanged so weights don't drift.
         print(f'  Skipping incremental NN update: {YESTERDAY} is pre-May-1 (early-season OOD window)')
         _save_nn_to_s3(nn, NN_MODEL_PATH)
         print(f'  NN saved to {NN_MODEL_PATH} (unchanged)')
     else:
-        # Incremental train: 5 epochs on yesterday's S3 batch
+        # Incremental train: A+B+C update (_incremental_update) on yesterday's S3 batch
         yesterday_path = (f's3://nrfi-store/data/{YESTERDAY.year}/'
                           f'{YESTERDAY.month}/{YESTERDAY.day}.txt')
         try:
             batch_df = load_data(yesterday_path)
-            # Quality gate: if pitcher RA is missing for most games, the lambda's
-            # RA source failed. Training on fully-imputed RA destroys feature variance
-            # and causes the NN to drift toward a constant output over multiple days.
-            _ra_null_rate = batch_df[['away_pitcher_ra', 'home_pitcher_ra']].isna().values.mean()
-            if _ra_null_rate > 0.5:
-                print(f'  WARNING: {_ra_null_rate:.0%} of pitcher RA values are null in batch '
-                      f'({YESTERDAY}) — skipping increment to prevent feature collapse')
+            # Quality gate: skip the increment when the batch's key features are largely degenerate. The upstream stat source writes 0 OR NaN on failure; both get imputed to the league median downstream, which destroys feature variance and drifts the NN toward a constant output over successive days. isna() alone misses the imputed-to-zero case, so count nulls AND zero-sentinels across RA, WHIP, and OPS.
+            _dq_cols  = [c for c in ['away_pitcher_ra', 'home_pitcher_ra',
+                                     'away_whip', 'home_whip', 'away_ops', 'home_ops']
+                         if c in batch_df.columns]
+            _dq_vals  = batch_df[_dq_cols].apply(pd.to_numeric, errors='coerce')
+            _dq_bad_rate = float((_dq_vals.isna() | (_dq_vals == 0)).values.mean())
+            if _dq_bad_rate > 0.5:
+                print(f'  WARNING: {_dq_bad_rate:.0%} of batch RA/WHIP/OPS values are missing or '
+                      f'zero ({YESTERDAY}) — skipping increment to prevent feature collapse')
                 _save_nn_to_s3(nn, NN_MODEL_PATH)
                 print(f'  NN saved to {NN_MODEL_PATH} (unchanged)')
             else:
@@ -821,8 +919,13 @@ if nn is not None:
                     print(f'  WARNING: batch has no clean rows after NaN drop — skipping increment')
                 else:
                     X_batch = nn_scaler.transform(feat_batch.values)
-                    nn.fit(X_batch, y_batch, epochs=5, batch_size=64, verbose=0)
-                    print(f'  Incremental train: 5 epochs on {len(feat_batch)} games from {YESTERDAY}')
+                    _n_upd  = _incremental_update(
+                        nn, X_batch, y_batch, X_nn_all, y,
+                        seed=int(YESTERDAY.strftime('%Y%m%d')))
+                    print(f'  Incremental update (A+B+C): {len(feat_batch)} new games '
+                          f'+ {min(NN_REPLAY_N, len(y))} replay = {_n_upd} rows, '
+                          f'1-epoch SGD(lr={NN_ONLINE_LR}, mom={NN_ONLINE_MOMENTUM}) '
+                          f'+ L2-SP(λ={NN_L2SP_LAMBDA}) from {YESTERDAY}')
                 _save_nn_to_s3(nn, NN_MODEL_PATH)
                 print(f'  NN saved to {NN_MODEL_PATH}')
         except Exception as ex:
@@ -842,46 +945,25 @@ else:
         _save_nn_to_s3(nn, NN_MODEL_PATH)
         print(f'  NN saved to {NN_MODEL_PATH}')
 
-# CV threshold tuning for NN (same sweep as LR)
-nn_cv_probs_all, nn_cv_y_all = [], []
-kf_nn = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-for tr, vl in kf_nn.split(X_raw, y):
-    sc_nn = StandardScaler()
-    X_tr_nn = sc_nn.fit_transform(X_raw[tr])
-    X_vl_nn = sc_nn.transform(X_raw[vl])
-    m_nn = _build_nn(X_tr_nn.shape[1])
-    es_cv = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss', patience=10, restore_best_weights=True, verbose=0
-    )
-    m_nn.fit(X_tr_nn, y[tr], epochs=50, batch_size=64,
-             validation_split=0.1, callbacks=[es_cv], verbose=0)
-    nn_cv_probs_all.append(m_nn.predict(X_vl_nn, verbose=0).flatten())
-    nn_cv_y_all.append(y[vl])
-    tf.keras.backend.clear_session()
-
-nn_cv_probs   = np.concatenate(nn_cv_probs_all)
-nn_cv_y       = np.concatenate(nn_cv_y_all)
-nn_cv_boundary = nn_cv_y.mean()
-
-nn_eligible = []
-for t in np.round(np.arange(0.52, 0.631, 0.005), 3):
-    acc, n, cov = confident_metrics(nn_cv_probs, nn_cv_y, round(1-t, 3), t, nn_cv_boundary)
-    if acc is not None and MIN_COVERAGE <= cov <= MAX_COVERAGE:
-        nn_eligible.append((t, acc, n, cov))
-
-nn_best   = max(nn_eligible, key=lambda r: edge_score(r[1], r[3])) if nn_eligible else None
-nn_high   = nn_best[0] if nn_best else 0.545
-nn_low    = round(1 - nn_high, 3)
-
-# Calibrate boundary from the production model's actual output distribution.
-# LR is guaranteed to match y.mean() by construction; NN is not — its sigmoid
-# outputs can sit systematically above or below the true base rate depending on
-# how it converged, causing directional disagreements on marginal games.
+# Calibrate the direction boundary from the production model's actual output distribution. LR matches y.mean() by construction; the NN's sigmoid outputs can sit systematically above or below the base rate. Pred direction and the agreement check both use this single boundary so a marginal NN output is classified consistently.
 nn_calibrated_boundary = float(nn.predict(X_nn_all, verbose=0).mean())
 nn_meta   = {'boundary': nn_calibrated_boundary}
-print(f'NN CV threshold:  <{nn_low} / >{nn_high}'
-      + (f'  (acc={nn_best[1]:.1%}, cov={nn_best[3]:.1%})' if nn_best else '  (fallback)')
-      + f'  [boundary={nn_calibrated_boundary:.4f} vs y.mean={y.mean():.4f}]')
+
+# NN confidence band: PERCENTILE of recent live outputs (rolling NN_POOL_DAYS window), targeting NN_COVERAGE_TARGET coverage on the distribution actually being scored. A fixed CV margin undershot deployment coverage badly (the live outputs are shifted/ compressed vs historical CV). If the rolling pool is too small (early season / no OUTPUT_BUCKET), fall back to a symmetric margin around the calibrated boundary.
+_nn_pool = _recent_nn_pool(TODAY, NN_POOL_DAYS)
+_tail    = NN_COVERAGE_TARGET / 2.0
+if len(_nn_pool) >= NN_POOL_MIN:
+    nn_low  = round(float(np.percentile(_nn_pool, _tail * 100)), 4)
+    nn_high = round(float(np.percentile(_nn_pool, (1 - _tail) * 100)), 4)
+    _cov_chk = float((_nn_pool < nn_low).mean() + (_nn_pool > nn_high).mean())
+    print(f'NN band (percentile of {len(_nn_pool)} recent outputs):  <{nn_low} / >{nn_high}  '
+          f'(cov {_cov_chk:.1%}, target {NN_COVERAGE_TARGET:.0%}, boundary {nn_calibrated_boundary:.4f})')
+else:
+    _fallback_margin = 0.045
+    nn_low  = round(nn_calibrated_boundary - _fallback_margin, 3)
+    nn_high = round(nn_calibrated_boundary + _fallback_margin, 3)
+    print(f'NN band (FALLBACK margin {_fallback_margin}; only {len(_nn_pool)} pooled '
+          f'outputs < {NN_POOL_MIN}):  <{nn_low} / >{nn_high}  boundary {nn_calibrated_boundary:.4f}')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 2 — CV THRESHOLD TUNING
@@ -898,20 +980,31 @@ cv_probs    = np.concatenate(cv_probs_all)
 cv_y        = np.concatenate(cv_y_all)
 cv_boundary = cv_y.mean()
 
-sweep   = np.round(np.arange(0.52, 0.631, 0.005), 3)
+# Sweep a band half-width (margin); the band is boundary ± margin so that the confidence band shares ONE reference point with the prediction direction (cv_boundary == y.mean() here, since CV covers every row exactly once).
+sweep   = np.round(np.arange(0.02, 0.131, 0.005), 3)
 cv_rows = []
-for t in sweep:
-    acc, n, cov = confident_metrics(cv_probs, cv_y, round(1 - t, 3), t, cv_boundary)
+for mgn in sweep:
+    acc, n, cov = confident_metrics(
+        cv_probs, cv_y,
+        round(cv_boundary - mgn, 4), round(cv_boundary + mgn, 4),
+        cv_boundary)
     if acc is not None:
-        cv_rows.append((t, acc, n, cov))
+        cv_rows.append((mgn, acc, n, cov))
 
-eligible  = [(t, a, n, c) for t, a, n, c in cv_rows if MIN_COVERAGE <= c <= MAX_COVERAGE]
+eligible  = [(mgn, a, n, c) for mgn, a, n, c in cv_rows if MIN_COVERAGE <= c <= MAX_COVERAGE]
 best      = max(eligible, key=lambda r: edge_score(r[1], r[3])) if eligible else None
-THRESHOLD = best[0] if best else 0.545
+MARGIN    = best[0] if best else 0.045
 
-print(f'CV threshold:  <{round(1 - THRESHOLD, 3)} / >{THRESHOLD}  '
-      f'(acc={best[1]:.1%}, cov={best[3]:.1%}, edge={edge_score(best[1], best[3]):.4f})')
-cw_metric('LRThreshold',  THRESHOLD,             unit='None')
+# One LR boundary everywhere: prediction direction, band center, agreement.
+LOW  = round(BOUNDARY - MARGIN, 3)
+HIGH = round(BOUNDARY + MARGIN, 3)
+
+if best:
+    print(f'LR CV band:  boundary {BOUNDARY:.4f} ± {MARGIN:.3f}  ->  <{LOW} / >{HIGH}  '
+          f'(acc={best[1]:.1%}, cov={best[3]:.1%}, edge={edge_score(best[1], best[3]):.4f})')
+else:
+    print(f'LR CV band:  boundary {BOUNDARY:.4f} ± {MARGIN:.3f}  ->  <{LOW} / >{HIGH}  (fallback)')
+cw_metric('LRBandMargin', MARGIN,                unit='None')
 cw_metric('LRCVAccuracy', best[1] if best else 0.0, unit='None')
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1036,8 +1129,7 @@ def get_yrfi(abbv, split_curr, split_prev, overall, fallback=LEAGUE_YRFI):
     return fallback, 'league'
 
 # ── 4b. Pitcher + team stats (MLB Stats API — 30/60-day rolling windows) ─────
-# Fangraphs blocked by Cloudflare; MLB Stats API supports identical date ranges
-# with no auth and no rate limiting.
+# Fangraphs blocked by Cloudflare; MLB Stats API supports identical date ranges with no auth and no rate limiting.
 print('Fetching pitcher/team stats (MLB Stats API)...')
 PITCHER_RA, PITCHER_WHIP, TEAM_OPS = {}, {}, {}
 
@@ -1056,8 +1148,7 @@ MLB_TEAM_ABBV = {
 }
 
 try:
-    # Pitcher RA + WHIP: 60-day rolling window, starters only (gamesStarted > 0)
-    # RA = runs / inningsPitched — per-inning scale matches training data (~0.47 median)
+    # Pitcher RA + WHIP: 60-day rolling window, starters only (gamesStarted > 0) RA = runs / inningsPitched — per-inning scale matches training data (~0.47 median)
     d60 = YESTERDAY - timedelta(days=59)
     pit_url = (
         f'https://statsapi.mlb.com/api/v1/stats'
@@ -1085,8 +1176,7 @@ try:
 except Exception as ex:
     print(f'  WARNING: MLB Stats API pitcher fetch failed ({ex})')
 
-# Individual batter OPS: 30-day rolling — matches training data window.
-# Used for lineup-level OPS lookup; team average is the fallback.
+# Individual batter OPS: 30-day rolling — matches training data window. Used for lineup-level OPS lookup; team average is the fallback.
 BATTER_OPS   = {}   # cleaned_name -> OPS
 TEAM_AVG_OPS = {}   # abbv -> mean OPS of players on that team (30-day)
 
@@ -1166,8 +1256,7 @@ def _fetch_lineup(game_id):
         pass
     return [], []
 
-# Build yesterday's team_id -> game_id map for lineup fallback.
-# Used when today's lineup isn't posted yet (typical at 11 AM ET).
+# Build yesterday's team_id -> game_id map for lineup fallback. Used when today's lineup isn't posted yet (typical at 11 AM ET).
 YESTERDAY_GAME_BY_TEAM = {}  # team_id (int) -> game_id
 try:
     yest_sched = statsapi.schedule(date=YESTERDAY.strftime('%m/%d/%Y'))
@@ -1389,28 +1478,29 @@ print_data_quality_report(rows)
 X_today    = scaler.transform(today_df[FEATURES].values)
 X_today_nn = nn_scaler.transform(today_df[FEATURES].values)
 
-# LR
+nn_boundary_today = nn_meta['boundary']
+
+# LR — direction set by LR's own boundary (matches the band center).
 lr_probs = lr.predict_proba(X_today)[:, 1]
 today_df['lr_prob_yrfi'] = lr_probs
 today_df['lr_prob_nrfi'] = 1 - lr_probs
 today_df['lr_pred']      = np.where(lr_probs > BOUNDARY, 'YRFI', 'NRFI')
 today_df['lr_conf']      = np.where(lr_probs > BOUNDARY, lr_probs, 1 - lr_probs)
 
-# NN
+# NN — direction set by the NN's calibrated boundary (matches the band center).
 nn_probs = nn.predict(X_today_nn, verbose=0).flatten()
 today_df['nn_prob_yrfi'] = nn_probs
 today_df['nn_prob_nrfi'] = 1 - nn_probs
-today_df['nn_pred']      = np.where(nn_probs > nn_meta['boundary'], 'YRFI', 'NRFI')
-today_df['nn_conf']      = np.where(nn_probs > nn_meta['boundary'], nn_probs, 1 - nn_probs)
+today_df['nn_pred']      = np.where(nn_probs > nn_boundary_today, 'YRFI', 'NRFI')
+today_df['nn_conf']      = np.where(nn_probs > nn_boundary_today, nn_probs, 1 - nn_probs)
 
-LOW, HIGH = round(1 - THRESHOLD, 3), THRESHOLD
-# Use 0.5 for direction agreement — calibrated NN boundary can drift above 0.50,
-# which would classify a 51% NN output as NRFI and cause spurious disagreements.
-_models_agree_direction = (lr_probs > 0.5) == (nn_probs > 0.5)
-today_df['lr_confident'] = ((lr_probs < LOW) | (lr_probs > HIGH)) & _models_agree_direction
-today_df['nn_confident'] = ((nn_probs < nn_low) | (nn_probs > nn_high)) & _models_agree_direction
-today_df['consensus']    = today_df['lr_confident'] & today_df['nn_confident'] \
-                           & _models_agree_direction
+# Each model's pick is recommended INDEPENDENTLY: a model is "confident" when its probability falls outside its own boundary-centered band. Cross-model agreement is NOT required for an individual pick — only for the consensus tag.
+today_df['lr_confident'] = (lr_probs < LOW) | (lr_probs > HIGH)
+today_df['nn_confident'] = (nn_probs < nn_low) | (nn_probs > nn_high)
+
+# Consensus = both models confident AND agreeing on direction. Each model's direction is measured against its OWN boundary, identical to how that model's prediction and band are defined (one reference point per model).
+_models_agree_direction = (lr_probs > BOUNDARY) == (nn_probs > nn_boundary_today)
+today_df['consensus']    = today_df['lr_confident'] & today_df['nn_confident'] & _models_agree_direction
 
 cw_metric('LRPickCount',        int(today_df['lr_confident'].sum()))
 cw_metric('NNPickCount',        int(today_df['nn_confident'].sum()))
@@ -1521,8 +1611,7 @@ nn_payload = print_picks_section(
     'nn_pred', 'nn_conf', 'nn_ev', 'nn_prob_nrfi', 'nn_prob_yrfi',
 )
 
-# Drop any NN pick that contradicts LR's direction for the same game.
-# Without this, the email merges them into "NN,LR → YRFI" even when NN said NRFI.
+# Drop any NN pick that contradicts LR's direction for the same game. Without this, the email merges them into "NN,LR → YRFI" even when NN said NRFI.
 _lr_directions = {p['matchup']: p['prediction'] for p in lr_payload}
 _nn_filtered   = [p for p in nn_payload
                   if p['matchup'] not in _lr_directions
@@ -1530,13 +1619,14 @@ _nn_filtered   = [p for p in nn_payload
 picks_payload = lr_payload + _nn_filtered
 
 deliver_picks(
-    picks_payload, str(TODAY), THRESHOLD,
+    picks_payload, str(TODAY), LOW, HIGH,
     best[1] if best else 0.0,
     best[3] if best else 0.0,
 )
 
 # ── Save full game log (all games, both models) ───────────────────────────────
-def save_game_log(df, date_str, lr_threshold, nn_threshold_low, nn_threshold_high,
+def save_game_log(df, date_str, lr_threshold_low, lr_threshold_high,
+                  nn_threshold_low, nn_threshold_high,
                   lr_boundary, nn_boundary, cv_acc, cv_cov):
     """
     Save a detailed per-game snapshot to S3 for later result grading.
@@ -1562,8 +1652,8 @@ def save_game_log(df, date_str, lr_threshold, nn_threshold_low, nn_threshold_hig
             'lr_conf':            round(r['lr_conf'], 4),
             'lr_confident':       bool(r['lr_confident']),
             'lr_ev':              r['lr_ev'],
-            'lr_threshold_low':   round(1 - lr_threshold, 3),
-            'lr_threshold_high':  round(lr_threshold, 3),
+            'lr_threshold_low':   round(lr_threshold_low, 3),
+            'lr_threshold_high':  round(lr_threshold_high, 3),
             'lr_boundary':        round(lr_boundary, 4),
             # NN outputs
             'nn_prob_nrfi':       round(r['nn_prob_nrfi'], 4),
@@ -1588,6 +1678,8 @@ def save_game_log(df, date_str, lr_threshold, nn_threshold_low, nn_threshold_hig
             'away_yrfi_pct':      r['_away_yrfi'],
             'home_ra':            r['_home_ra'],
             'home_whip':          r['_home_whip'],
+            'away_ra':            r['_away_ra'],
+            'away_whip':          r['_away_whip'],
             'home_ops':           r['_home_ops'],
             'away_ops':           r['_away_ops'],
             'park_factor':        r['_park'],
@@ -1625,7 +1717,7 @@ def save_game_log(df, date_str, lr_threshold, nn_threshold_low, nn_threshold_hig
         print(f'  WARNING: game log write failed ({ex})')
 
 save_game_log(
-    today_df, str(TODAY), THRESHOLD,
+    today_df, str(TODAY), LOW, HIGH,
     nn_low, nn_high,
     BOUNDARY, nn_meta['boundary'],
     best[1] if best else 0.0,
@@ -1693,8 +1785,8 @@ email_html = build_email_html(
     yesterday_rows=yesterday_log_df,
     ytd_df=ytd_df,
     today_df_all=today_df,
-    lr_threshold=THRESHOLD,
-    nn_threshold=nn_high,
+    lr_band=(LOW, HIGH),
+    nn_band=(nn_low, nn_high),
     cv_acc=best[1] if best else 0.0,
     cv_cov=best[3] if best else 0.0,
     yesterday=YESTERDAY,
@@ -1703,10 +1795,7 @@ email_html = build_email_html(
     get_odds_fn=get_odds,
 )
 
-# Build 7-day confidence band timeline chart for email.
-# Load the past 6 game_log CSVs directly from S3 — these are written unconditionally
-# by save_game_log() and exist even when Lambda results are absent (which would cause
-# grade_yesterday() to return ytd_df=None, leaving the chart with only 1 day of data).
+# Build 7-day confidence band timeline chart for email. Load the past 6 game_log CSVs directly from S3 — these are written unconditionally by save_game_log() and exist even when Lambda results are absent (which would cause grade_yesterday() to return ytd_df=None, leaving the chart with only 1 day of data).
 _chart_bytes = None
 try:
     _hist_dfs = []

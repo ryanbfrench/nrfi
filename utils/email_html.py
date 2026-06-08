@@ -26,7 +26,7 @@ def _pl_str(pl):
 
 
 def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
-                     lr_threshold, nn_threshold, cv_acc, cv_cov,
+                     lr_band, nn_band, cv_acc, cv_cov,
                      *, yesterday, today, unit, get_odds_fn=None):
     """
     Full daily email HTML.
@@ -189,10 +189,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
     # ── Helper: build a single-row game block ─────────────────────────────────
     def game_rows(r, picked=False, pick_info=None):
         matchup = r['matchup'].replace('Athletics', 'ATH')
-        # Color only when the model is actually confident (making a pick).
-        # Not-confident games show grey — regardless of which side of the
-        # calibrated mean the probability sits on — to avoid implying a
-        # directional lean when no pick was made.
+        # Color only when the model is actually confident (making a pick). Not-confident games show grey — regardless of which side of the calibrated mean the probability sits on — to avoid implying a directional lean when no pick was made.
         lr_conf = bool(r.get('lr_confident', False))
         nn_conf = bool(r.get('nn_confident', False))
         lrc  = (G if r['lr_pred'] == 'NRFI' else R) if lr_conf else MUT
@@ -319,9 +316,9 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
               font-size:11px;color:{MUT};text-align:center">
     Generated {gen_time} {tz_name} &nbsp;&middot;&nbsp; 1u = ${unit}
     &nbsp;&middot;&nbsp;
-    LR &lt;{round(1-lr_threshold,3)} / &gt;{lr_threshold}
+    LR &lt;{lr_band[0]} / &gt;{lr_band[1]}
     &nbsp;&middot;&nbsp;
-    NN &lt;{round(1-nn_threshold,3)} / &gt;{nn_threshold}
+    NN &lt;{nn_band[0]} / &gt;{nn_band[1]}
     &nbsp;&middot;&nbsp;
     CV {cv_acc:.1%} acc &nbsp;{cv_cov:.1%} cov
   </div>
