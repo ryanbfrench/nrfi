@@ -1,17 +1,4 @@
-"""
-One-time backfill: compute first-inning pitcher RA for the current season
-from statsapi linescore data and save to s3://nrfi-store/pitcher_ra/{year}.json.
-
-Run locally before the next lambda invocation:
-    python utils/backfill_pitcher_ra.py
-
-The lambda will then load this file and only add yesterday's increment each day.
-
-RA definition: runs allowed by the starting pitcher in their half of the 1st inning,
-computed as total_1st_inn_runs / number_of_starts.
-  - Home starter: faces away team in the TOP of the 1st (top1 = away team's runs)
-  - Away starter: faces home team in the BOTTOM of the 1st (bot1 = home team's runs)
-"""
+"""One-time backfill: compute first-inning pitcher RA for the current season from statsapi linescore data and save to s3://nrfi-store/pitcher_ra/{year}.json. Run locally before the next lambda invocation: python utils/backfill_pitcher_ra.py The lambda will then load this file and only add yesterday's increment each day. RA definition: runs allowed by the starting pitcher in their half of the 1st inning, computed as total_1st_inn_runs / number_of_starts. - Home starter: faces away team in the TOP of the 1st (top1 = away team's runs) - Away starter: faces home team in the BOTTOM of the 1st (bot1 = home team's runs)"""
 
 import json
 import re

@@ -1,10 +1,4 @@
-"""
-test_email.py — end-to-end email test using real S3 data.
-Pulls results.csv (7-day history + thresholds) and today's game log,
-builds the full email HTML, and sends via SES.
-
-Run from the project root: python test_email.py
-"""
+"""test_email.py — end-to-end email test using real S3 data. Pulls results.csv (7-day history + thresholds) and today's game log, builds the full email HTML, and sends via SES. Run from the project root: python test_email.py"""
 
 import io, json, os, sys
 import pandas as pd

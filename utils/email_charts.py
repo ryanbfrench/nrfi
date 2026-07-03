@@ -1,29 +1,4 @@
-"""
-utils/email_charts.py
----------------------
-7-day confidence band chart embedded in the daily email.
-
-Layout: 2 rows × 7 columns.
-  - Row 0: Logistic Regression
-  - Row 1: Neural Network
-  - Each column: one day's games
-
-Within each cell:
-  - Horizontal shaded bands: NRFI (blue), no-pick (grey), YRFI (purple)
-  - Threshold boundary lines (horizontal)
-  - One dot per game; confident picks filled, unconfident hollow
-    - Green: confident + correct
-    - Red:   confident + incorrect
-    - Blue/purple: confident + ungraded (today)
-    - Hollow: no pick
-
-history_df must contain: game_date (YYYY-MM-DD str), matchup,
-lr_prob_yrfi, lr_threshold_low, lr_threshold_high, lr_confident,
-nn_prob_yrfi, nn_threshold_low, nn_threshold_high, nn_confident.
-Optional for result coloring: lr_correct, nn_correct (0/1/NaN).
-
-Returns PNG bytes for inline CID attachment, or None on failure.
-"""
+"""utils/email_charts.py --------------------- 7-day confidence band chart embedded in the daily email. Layout: 2 rows × 7 columns. - Row 0: Logistic Regression - Row 1: Neural Network - Each column: one day's games Within each cell: - Horizontal shaded bands: NRFI (blue), no-pick (grey), YRFI (purple) - Threshold boundary lines (horizontal) - One dot per game; confident picks filled, unconfident hollow - Green: confident + correct - Red: confident + incorrect - Blue/purple: confident + ungraded (today) - Hollow: no pick history_df must contain: game_date (YYYY-MM-DD str), matchup, lr_prob_yrfi, lr_threshold_low, lr_threshold_high, lr_confident, nn_prob_yrfi, nn_threshold_low, nn_threshold_high, nn_confident. Optional for result coloring: lr_correct, nn_correct (0/1/NaN). Returns PNG bytes for inline CID attachment, or None on failure."""
 
 import io
 from datetime import datetime
@@ -96,10 +71,7 @@ def build_threshold_timeline(history_df):
 
                 day_rows = all_rows[all_rows['game_date'] == date].copy()
 
-                # Threshold for this day — stored columns are the primary source,
-                # but we verify against confident flags (historical data may have
-                # wrong per-model thresholds saved). If any confident pick sits
-                # inside the stored band, infer from the actual picks instead.
+                # Threshold for this day — stored columns are the primary source, but we verify against confident flags (historical data may have wrong per-model thresholds saved). If any confident pick sits inside the stored band, infer from the actual picks instead.
                 tl, th = 0.455, 0.545
                 if not day_rows.empty:
                     tl = float(day_rows[low_col].iloc[0])
@@ -124,9 +96,7 @@ def build_threshold_timeline(history_df):
                 ax.axhline(tl, color=COLOR_NRFI, lw=1.2, alpha=0.8, zorder=2)
                 ax.axhline(th, color=COLOR_YRFI, lw=1.2, alpha=0.8, zorder=2)
 
-                # Game dots — confident column is ground truth for whether that
-                # model picked the game. Parse carefully: CSV round-trips booleans
-                # as "True"/"False" strings, and bool("False") == True in Python.
+                # Game dots — confident column is ground truth for whether that model picked the game. Parse carefully: CSV round-trips booleans as "True"/"False" strings, and bool("False") == True in Python.
                 for g_idx, (_, row) in enumerate(day_rows.iterrows()):
                     prob      = float(row[prob_col])
                     conf_val  = row.get(conf_col, False)

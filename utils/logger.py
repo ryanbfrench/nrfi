@@ -1,14 +1,4 @@
-"""
-utils/logger.py
----------------
-Structured logging and CloudWatch custom metrics for the NRFI pipeline.
-
-log()    — Emits JSON-structured lines to stdout.
-           SageMaker and Lambda both stream stdout to CloudWatch Logs automatically.
-
-metric() — Emits a CloudWatch custom metric under the NRFI/Pipeline namespace.
-           Fails silently — a metric failure never crashes the pipeline.
-"""
+"""utils/logger.py --------------- Structured logging and CloudWatch custom metrics for the NRFI pipeline. log() — Emits JSON-structured lines to stdout. SageMaker and Lambda both stream stdout to CloudWatch Logs automatically. metric() — Emits a CloudWatch custom metric under the NRFI/Pipeline namespace. Fails silently — a metric failure never crashes the pipeline."""
 
 import json
 from datetime import datetime, timezone
@@ -29,14 +19,7 @@ def _get_cw():
 
 
 def log(level, msg, **ctx):
-    """
-    Print a structured JSON log line to stdout.
-
-    Args:
-        level: 'INFO' | 'WARN' | 'ERROR'
-        msg:   Human-readable message string
-        **ctx: Additional key=value context fields
-    """
+    """Print a structured JSON log line to stdout. Args: level: 'INFO' | 'WARN' | 'ERROR' msg: Human-readable message string **ctx: Additional key=value context fields"""
     rec = {
         'level': level,
         'ts':    datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -47,23 +30,7 @@ def log(level, msg, **ctx):
 
 
 def metric(name, value, unit='Count', dimensions=None):
-    """
-    Emit a CloudWatch custom metric under the NRFI/Pipeline namespace.
-
-    Uses daily StorageResolution (86400s) to minimize cost.
-    PutMetricData does not support resource-level IAM restrictions — the
-    SageMaker/Lambda role must have cloudwatch:PutMetricData on "*".
-
-    Args:
-        name:       Metric name (e.g. 'LRPickCount')
-        value:      Numeric value
-        unit:       CloudWatch unit string (default 'Count')
-                    Common: 'Count', 'None', 'Dollars', 'Percent'
-        dimensions: Optional dict of {Name: Value} dimension pairs
-                    (e.g. {'Model': 'LR'})
-
-    Fails silently — never crashes the pipeline.
-    """
+    """Emit a CloudWatch custom metric under the NRFI/Pipeline namespace. Uses daily StorageResolution (86400s) to minimize cost. PutMetricData does not support resource-level IAM restrictions — the SageMaker/Lambda role must have cloudwatch:PutMetricData on "*". Args: name: Metric name (e.g. 'LRPickCount') value: Numeric value unit: CloudWatch unit string (default 'Count') Common: 'Count', 'None', 'Dollars', 'Percent' dimensions: Optional dict of {Name: Value} dimension pairs (e.g. {'Model': 'LR'}) Fails silently — never crashes the pipeline."""
     cw = _get_cw()
     if cw is None:
         return

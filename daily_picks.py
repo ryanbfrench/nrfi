@@ -181,8 +181,7 @@ def load_data(path):
 
 # ── Weather (Open-Meteo, free, no API key required) ───────────────────────────
 def fetch_weather(abbv, target_date):
-    """Return (temp_F, rain, source) for a team's home stadium on target_date.
-    source is 'api' when live data was fetched, 'default' when fallback values are used."""
+    """Return (temp_F, rain, source) for a team's home stadium on target_date. source is 'api' when live data was fetched, 'default' when fallback values are used."""
     coords = STADIUM_COORDS.get(abbv)
     if coords is None:
         return 65, 0, 'default'
@@ -203,8 +202,7 @@ def fetch_weather(abbv, target_date):
     except Exception:
         return 65, 0, 'default'
 
-# ── Odds scraping (The Odds API — totals_1st_1_innings) ──────────────────────
-# Market: Over/Under 0.5 first-inning runs. Over = YRFI, Under = NRFI. Free tier: 500 requests/month. ~15 games/day ≈ 450 requests/month. Env var: ODDS_API_KEY
+# ── Odds scraping (The Odds API — totals_1st_1_innings) ────────────────────── Market: Over/Under 0.5 first-inning runs. Over = YRFI, Under = NRFI. Free tier: 500 requests/month. ~15 games/day ≈ 450 requests/month. Env var: ODDS_API_KEY
 
 _ODDS_API_TEAM_MAP = {
     'arizona diamondbacks': 'ARI', 'atlanta braves': 'ATL', 'baltimore orioles': 'BAL',
@@ -228,21 +226,7 @@ def _decimal_to_american(dec):
         return int(round(-100 / (dec - 1)))
 
 def fetch_odds():
-    """
-    Fetch NRFI/YRFI odds via The Odds API.
-
-    Primary market: totals_1st_1_innings at point=0.5 only.
-      Over 0.5 = YRFI, Under 0.5 = NRFI. Lines at any other point are ignored
-      for NRFI/YRFI odds (a line at 1.5 is a different bet).
-
-    Requests American-format odds directly (same as backfill_odds_2025.py) and
-    saves a raw snapshot to s3://nrfi-store/odds/{year}/{date}.json so historical
-    odds are stored in a consistent format for future analysis.
-
-    Returns:
-      odds — dict: 'AWAY@HOME' -> (nrfi_odds, yrfi_odds) American ints
-    Falls back to Bovada scrape if API key not set.
-    """
+    """Fetch NRFI/YRFI odds via The Odds API. Primary market: totals_1st_1_innings at point=0.5 only. Over 0.5 = YRFI, Under 0.5 = NRFI. Lines at any other point are ignored for NRFI/YRFI odds (a line at 1.5 is a different bet). Requests American-format odds directly (same as backfill_odds_2025.py) and saves a raw snapshot to s3://nrfi-store/odds/{year}/{date}.json so historical odds are stored in a consistent format for future analysis. Returns: odds — dict: 'AWAY@HOME' -> (nrfi_odds, yrfi_odds) American ints Falls back to Bovada scrape if API key not set."""
     api_key = os.environ.get('ODDS_API_KEY')
     if not api_key:
         return _fetch_odds_bovada_fallback()
@@ -425,8 +409,7 @@ def deliver_picks(picks_rows, date_str, band_low, band_high, cv_acc, cv_cov):
         except Exception as ex:
             print(f'  WARNING: SNS publish failed ({ex})')
 
-# ── SES HTML email ───────────────────────────────────────────────────────────
-# build_email_html and send_email live in utils/email_html.py
+# ── SES HTML email ─────────────────────────────────────────────────────────── build_email_html and send_email live in utils/email_html.py
 
 def _odds_str(val):
     if val is None: return '—'
@@ -440,13 +423,7 @@ def _ev_str(units, dollars):
 
 # ── Grade yesterday's picks ───────────────────────────────────────────────────
 def grade_yesterday():
-    """
-    Load yesterday's game log and Lambda results file from S3.
-    Fill in actual_yrfi, lr_correct, nn_correct on every game.
-    Append completed rows to results/results.csv.
-    Prints a W/L summary for confident picks.
-    Silently skips if either file is missing.
-    """
+    """Load yesterday's game log and Lambda results file from S3. Fill in actual_yrfi, lr_correct, nn_correct on every game. Append completed rows to results/results.csv. Prints a W/L summary for confident picks. Silently skips if either file is missing."""
     s3_bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
     if not s3_bucket:
         return None, None
@@ -590,11 +567,7 @@ def grade_yesterday():
 
 
 def _analyze_dq_outcomes(df):
-    """
-    Compare model accuracy on high-data-quality vs imputed games.
-    Printed to console; only runs when dq_n_imputed column is present and
-    we have at least 20 graded LR confident picks to draw from.
-    """
+    """Compare model accuracy on high-data-quality vs imputed games. Printed to console; only runs when dq_n_imputed column is present and we have at least 20 graded LR confident picks to draw from."""
     if df.empty or 'dq_n_imputed' not in df.columns:
         return
 
@@ -665,9 +638,7 @@ def _analyze_dq_outcomes(df):
 
 yesterday_log_df, ytd_df = grade_yesterday()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 1 — RETRAIN ON ALL HISTORICAL DATA
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 1 — RETRAIN ON ALL HISTORICAL DATA ══════════════════════════════════════════════════════════════════════════════
 print('=' * 60)
 print(f'DAILY PICKS  {TODAY}')
 print('=' * 60)
@@ -737,15 +708,7 @@ def _s3_model_exists(s3_path):
         return False
 
 def _load_nn_from_s3(s3_path, input_dim):
-    """Rebuild the architecture from _build_nn and load WEIGHTS ONLY (plain numpy).
-
-    We deliberately do NOT use tf.keras.models.load_model: full-model serialization
-    embeds the architecture config, whose schema changed between Keras 2 and 3
-    (InputLayer 'batch_input_shape' -> 'batch_shape'), so a model saved in one env
-    fails to load in another and silently falls back to scratch-retraining -- meaning
-    the incremental A+B+C updates never actually persist. get_weights/set_weights round
-    a flat list of numpy arrays, which is version-independent as long as the layer shapes
-    from _build_nn match (they're deterministic here)."""
+    """Rebuild the architecture from _build_nn and load WEIGHTS ONLY (plain numpy). We deliberately do NOT use tf.keras.models.load_model: full-model serialization embeds the architecture config, whose schema changed between Keras 2 and 3 (InputLayer 'batch_input_shape' -> 'batch_shape'), so a model saved in one env fails to load in another and silently falls back to scratch-retraining -- meaning the incremental A+B+C updates never actually persist. get_weights/set_weights round a flat list of numpy arrays, which is version-independent as long as the layer shapes from _build_nn match (they're deterministic here)."""
     import boto3, io
     bucket, key = s3_path[5:].split('/', 1)
     obj  = boto3.client('s3').get_object(Bucket=bucket, Key=key)
@@ -767,11 +730,7 @@ def _save_nn_to_s3(model, s3_path):
         print(f'  WARNING: could not save NN to S3 ({ex})')
 
 def _recent_nn_pool(end_date, n_days):
-    """Pool `nn_prob_yrfi` from the last `n_days` of game_logs ending before `end_date`.
-    Used to calibrate the NN confidence band by percentile on the live output
-    distribution. The NN evolves slowly (boundary drifts ~3e-4/day under the L2-SP
-    anchored incremental update), so stored outputs from recent days are a faithful
-    proxy for the current model's distribution. Returns a 1-D np.array (possibly empty)."""
+    """Pool `nn_prob_yrfi` from the last `n_days` of game_logs ending before `end_date`. Used to calibrate the NN confidence band by percentile on the live output distribution. The NN evolves slowly (boundary drifts ~3e-4/day under the L2-SP anchored incremental update), so stored outputs from recent days are a faithful proxy for the current model's distribution. Returns a 1-D np.array (possibly empty)."""
     bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
     if not bucket:
         return np.array([])
@@ -791,13 +750,7 @@ def _recent_nn_pool(end_date, n_days):
     return np.concatenate(probs) if probs else np.array([])
 
 def _build_nn(input_dim):
-    """8->8->8->1, lr=0.005, bs=64.  Regularization dialed back to l2=1e-5, dropout=0
-    (2026-06-07): the prior l2=1e-3 on all three layers compressed the sigmoid output
-    asymmetrically -- floor ~0.495, no left tail -- so the NN could NEVER produce a
-    confident NRFI pick (0% below the NRFI band on train AND 2026 data). Light reg
-    restores a symmetric ~25% NRFI tail (std~0.038) matching the LR. The kernel
-    regularizer only affects the from-scratch fit; the incremental update applies its
-    own L2-SP anchor in a custom loop, so this change is safe for daily stability."""
+    """8->8->8->1, lr=0.005, bs=64. Regularization dialed back to l2=1e-5, dropout=0 (2026-06-07): the prior l2=1e-3 on all three layers compressed the sigmoid output asymmetrically -- floor ~0.495, no left tail -- so the NN could NEVER produce a confident NRFI pick (0% below the NRFI band on train AND 2026 data). Light reg restores a symmetric ~25% NRFI tail (std~0.038) matching the LR. The kernel regularizer only affects the from-scratch fit; the incremental update applies its own L2-SP anchor in a custom loop, so this change is safe for daily stability."""
     reg = tf.keras.regularizers.l2(1e-5)
     model = tf.keras.Sequential([
         tf.keras.layers.Dense(8, activation='relu', input_shape=(input_dim,), kernel_regularizer=reg),
@@ -816,22 +769,7 @@ def _incremental_update(model, X_new, y_new, X_hist, y_hist, *,
                         replay_n=NN_REPLAY_N, lr=NN_ONLINE_LR,
                         momentum=NN_ONLINE_MOMENTUM, l2sp=NN_L2SP_LAMBDA,
                         epochs=1, seed=None):
-    """Stable online NN update — methods A + B + C.
-
-      A (streaming SGD): a single epoch of SGD+momentum at a low LR, so the day's
-        batch nudges the weights only slightly — a true online step, not the old
-        5-epoch refit that memorized each day's ~15 games.
-      B (experience replay): mix the new games with `replay_n` games sampled
-        UNIFORMLY from all history, so every update keeps re-seeing the full
-        distribution and cannot drift toward a constant output.
-      C (L2-SP): penalize ||w - w_prev||^2 — anchor to the PRE-UPDATE weights —
-        instead of ||w||^2. The model stays near what it already knew rather than
-        decaying toward zero (the original collapse driver).
-
-    Trains the model in place. Deliberately excludes the model's baked-in
-    l2(->0) kernel regularizers (`model.losses`) so only the L2-SP anchor acts
-    during the increment. Returns the number of rows trained on.
-    """
+    """Stable online NN update — methods A + B + C. A (streaming SGD): a single epoch of SGD+momentum at a low LR, so the day's batch nudges the weights only slightly — a true online step, not the old 5-epoch refit that memorized each day's ~15 games. B (experience replay): mix the new games with `replay_n` games sampled UNIFORMLY from all history, so every update keeps re-seeing the full distribution and cannot drift toward a constant output. C (L2-SP): penalize ||w - w_prev||^2 — anchor to the PRE-UPDATE weights — instead of ||w||^2. The model stays near what it already knew rather than decaying toward zero (the original collapse driver). Trains the model in place. Deliberately excludes the model's baked-in l2(->0) kernel regularizers (`model.losses`) so only the L2-SP anchor acts during the increment. Returns the number of rows trained on."""
     rng = np.random.default_rng(seed)
     if replay_n and len(y_hist) > 0:
         idx   = rng.choice(len(y_hist), size=min(replay_n, len(y_hist)), replace=False)
@@ -965,9 +903,7 @@ else:
     print(f'NN band (FALLBACK margin {_fallback_margin}; only {len(_nn_pool)} pooled '
           f'outputs < {NN_POOL_MIN}):  <{nn_low} / >{nn_high}  boundary {nn_calibrated_boundary:.4f}')
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 2 — CV THRESHOLD TUNING
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 2 — CV THRESHOLD TUNING ══════════════════════════════════════════════════════════════════════════════
 kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 cv_probs_all, cv_y_all = [], []
 for tr, vl in kf.split(X_raw, y):
@@ -1007,9 +943,7 @@ else:
 cw_metric('LRBandMargin', MARGIN,                unit='None')
 cw_metric('LRCVAccuracy', best[1] if best else 0.0, unit='None')
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 3 — FETCH TODAY'S GAMES
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 3 — FETCH TODAY'S GAMES ══════════════════════════════════════════════════════════════════════════════
 print(f'\nFetching schedule for {TODAY}...')
 sched = statsapi.schedule(date=TODAY.strftime('%m/%d/%Y'))
 
@@ -1067,9 +1001,7 @@ elif SESSION == 'evening':
     games = [g for g in games if not _is_afternoon(g['game_time'])]
     print(f'  Session=evening: {len(games)} games at 5pm ET or later')
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 4 — FETCH FEATURES
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 4 — FETCH FEATURES ══════════════════════════════════════════════════════════════════════════════
 
 # ── 4a. YRFI pct from teamrankings (current + prior-year fallback) ─────────────
 print(f'Fetching YRFI pct from teamrankings ({YESTERDAY})...')
@@ -1107,15 +1039,7 @@ except Exception as ex:
     print(f'  WARNING: prior-year teamrankings fetch failed ({ex})')
 
 def get_yrfi(abbv, split_curr, split_prev, overall, fallback=LEAGUE_YRFI):
-    """
-    Return (value, source) where source is one of: 'current', 'prior', 'overall', 'league'.
-
-    Before May 1: prior-year split → current split → overall → league average.
-      Current-year home/away splits are based on ~6 games before May; those tiny
-      samples produce extreme values (0-100%) that land 4-9 std deviations outside
-      the training distribution, making both models overconfident.
-    After May 1: current split → prior-year split → overall → league average.
-    """
+    """Return (value, source) where source is one of: 'current', 'prior', 'overall', 'league'. Before May 1: prior-year split → current split → overall → league average. Current-year home/away splits are based on ~6 games before May; those tiny samples produce extreme values (0-100%) that land 4-9 std deviations outside the training distribution, making both models overconfident. After May 1: current split → prior-year split → overall → league average."""
     use_prior_first = TODAY < date(TODAY.year, 5, 1)
     ordered = (
         [('prior', split_prev), ('current', split_curr), ('overall', overall)]
@@ -1128,8 +1052,7 @@ def get_yrfi(abbv, split_curr, split_prev, overall, fallback=LEAGUE_YRFI):
             return v, src_name
     return fallback, 'league'
 
-# ── 4b. Pitcher + team stats (MLB Stats API — 30/60-day rolling windows) ─────
-# Fangraphs blocked by Cloudflare; MLB Stats API supports identical date ranges with no auth and no rate limiting.
+# ── 4b. Pitcher + team stats (MLB Stats API — 30/60-day rolling windows) ───── Fangraphs blocked by Cloudflare; MLB Stats API supports identical date ranges with no auth and no rate limiting.
 print('Fetching pitcher/team stats (MLB Stats API)...')
 PITCHER_RA, PITCHER_WHIP, TEAM_OPS = {}, {}, {}
 
@@ -1177,8 +1100,9 @@ except Exception as ex:
     print(f'  WARNING: MLB Stats API pitcher fetch failed ({ex})')
 
 # Individual batter OPS: 30-day rolling — matches training data window. Used for lineup-level OPS lookup; team average is the fallback.
-BATTER_OPS   = {}   # cleaned_name -> OPS
-TEAM_AVG_OPS = {}   # abbv -> mean OPS of players on that team (30-day)
+BATTER_OPS      = {}   # cleaned_name -> OPS
+BATTER_OPS_BY_ID = {}  # personId -> OPS (lineup match: the boxscore gives short names, not full)
+TEAM_AVG_OPS    = {}   # abbv -> mean OPS of the team's top-4 hitters (30-day)
 
 try:
     d30 = YESTERDAY - timedelta(days=29)
@@ -1187,7 +1111,7 @@ try:
         f'?stats=season&group=hitting&season={TODAY.year}'
         f'&startDate={d30}&endDate={YESTERDAY}'
         f'&playerPool=All&limit=5000'
-        f'&fields=stats,splits,stat,ops,obp,slg,atBats,player,fullName,team,name'
+        f'&fields=stats,splits,stat,ops,obp,slg,atBats,player,fullName,id,team,name'
     )
     bat_resp = requests.get(bat_url, timeout=30)
     team_ops_lists = {}  # abbv -> [ops, ...]
@@ -1205,11 +1129,15 @@ try:
             continue
         name = unidecode(split['player']['fullName'].strip())
         BATTER_OPS[name] = ops_f
+        pid = split['player'].get('id')
+        if pid is not None:
+            BATTER_OPS_BY_ID[pid] = ops_f
         team_name = split.get('team', {}).get('name', '')
         abbv = MLB_TEAM_ABBV.get(team_name)
         if abbv:
             team_ops_lists.setdefault(abbv, []).append(ops_f)
-    TEAM_AVG_OPS = {abbv: round(sum(vals)/len(vals), 3)
+    # Team OPS fallback (used when no lineup is posted yet) = mean of the team's top-4 hitters by OPS — a proxy for the 1-4 batting order the model actually trains on (lambda's get_lineup caps at the first 4 hitters). The OLD fallback was a whole-roster mean over everyone with >=10 AB (~0.67), which biased every team toward a weak offense vs the ~0.79 training scale — the -1.3sigma OPS drift the data-quality report flagged. NOTE: top-4-BY-OPS (~0.85) runs a touch above top-4-BY-ORDER (~0.79), since the 4 best hitters aren't always the 4 who bat 1-4; this is a fallback estimate only and is superseded whenever a real (today/yesterday) lineup is available.
+    TEAM_AVG_OPS = {abbv: round(float(np.mean(sorted(vals, reverse=True)[:4])), 3)
                     for abbv, vals in team_ops_lists.items() if vals}
     print(f'  Loaded 30-day OPS for {len(BATTER_OPS)} batters ({len(TEAM_AVG_OPS)} teams)')
 except Exception as ex:
@@ -1233,28 +1161,27 @@ def get_pitcher_whip(name):
         return PITCHER_WHIP[cleaned], False
     return LEAGUE_WHIP, True
 
-def _lineup_ops(player_names):
-    """Average OPS of top-4 found batters in lineup. None if fewer than 2 found."""
-    vals = [BATTER_OPS[unidecode(n)] for n in player_names
-            if unidecode(n) in BATTER_OPS][:4]
+def _lineup_ops(batter_ids):
+    """Mean OPS of the top-4 batters (by personId) in the lineup — matches the training signal, which lambda's get_lineup builds from exactly the first 4 non-substitution hitters (`while hitters < 4`). The 1st inning is decided by the top of the order, so only those 4 are used. Matching by personId (not name) because the boxscore returns short names ("Alvarez, Y") that don't match the full-name OPS keys. None if fewer than 2 found."""
+    vals = [BATTER_OPS_BY_ID[i] for i in batter_ids if i in BATTER_OPS_BY_ID][:4]
     return round(sum(vals) / len(vals), 3) if len(vals) >= 2 else None
 
 def _fetch_lineup(game_id):
-    """Fetch lineup for a game. Returns (away_names, home_names) or ([], [])."""
+    """Return (away_ids, home_ids): personIds of the first 4 non-substitution hitters in each side's boxscore batting order. The old /api/v1/game/{id}/lineups endpoint was retired (404), which silently killed the lineup path and forced every game onto the team_avg fallback; the boxscore battingOrder is the live source and matches lambda's get_lineup. Empty lists when the order isn't posted yet (pre-game) → caller falls back to yesterday's lineup, then team_avg."""
     try:
-        r = requests.get(
-            f'https://statsapi.mlb.com/api/v1/game/{game_id}/lineups',
-            timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return (
-                [p['fullName'] for p in data.get('awayPlayers', [])],
-                [p['fullName'] for p in data.get('homePlayers', [])],
-            )
+        box = statsapi.boxscore_data(game_id)
     except Exception:
-        pass
-    return [], []
+        return [], []
+    def top4(side):
+        batters = box.get(side + 'Batters', [])
+        ids, i, n = [], 1, 0     # index 0 is the header row (matches lambda's i=1 start)
+        while n < 4 and i < len(batters):
+            b = batters[i]
+            if isinstance(b, dict) and not b.get('substitution', True) and b.get('personId'):
+                ids.append(b['personId']); n += 1
+            i += 1
+        return ids
+    return top4('away'), top4('home')
 
 # Build yesterday's team_id -> game_id map for lineup fallback. Used when today's lineup isn't posted yet (typical at 11 AM ET).
 YESTERDAY_GAME_BY_TEAM = {}  # team_id (int) -> game_id
@@ -1270,13 +1197,7 @@ except Exception as ex:
     print(f'  WARNING: Could not fetch yesterday schedule for lineup fallback ({ex})')
 
 def fetch_game_ops(game_id, away_abbv, home_abbv, away_team_id=None, home_team_id=None):
-    """
-    Return (away_ops, home_ops, away_src, home_src) using the best available lineup:
-      1. Today's announced lineup → source='lineup'
-      2. Yesterday's lineup for each side independently → source='yesterday'
-      3. 30-day team average OPS → source='team_avg'
-      4. League average → source='league'
-    """
+    """Return (away_ops, home_ops, away_src, home_src) using the best available lineup: 1. Today's announced lineup → source='lineup' 2. Yesterday's lineup for each side independently → source='yesterday' 3. 30-day team average OPS → source='team_avg' 4. League average → source='league'"""
     today_away, today_home = _fetch_lineup(game_id)
     away_ops = _lineup_ops(today_away)
     home_ops = _lineup_ops(today_home)
@@ -1336,9 +1257,7 @@ else:
 def get_odds(matchup_key):
     return GAME_ODDS.get(matchup_key)  # None if not available
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 5 — BUILD FEATURE ROWS FOR TODAY'S GAMES
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 5 — BUILD FEATURE ROWS FOR TODAY'S GAMES ══════════════════════════════════════════════════════════════════════════════
 print('\nBuilding feature rows...')
 rows = []
 for g in games:
@@ -1472,9 +1391,7 @@ def print_data_quality_report(rows_list):
 
 print_data_quality_report(rows)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 6 — APPLY MODELS
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 6 — APPLY MODELS ══════════════════════════════════════════════════════════════════════════════
 X_today    = scaler.transform(today_df[FEATURES].values)
 X_today_nn = nn_scaler.transform(today_df[FEATURES].values)
 
@@ -1522,9 +1439,7 @@ def compute_ev(probs_yrfi, preds, matchup_series):
 today_df['lr_ev'] = compute_ev(lr_probs, today_df['lr_pred'], today_df['matchup'])
 today_df['nn_ev'] = compute_ev(nn_probs, today_df['nn_pred'], today_df['matchup'])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 7 — OUTPUT
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════ PART 7 — OUTPUT ══════════════════════════════════════════════════════════════════════════════
 odds_note = '' if using_real_odds else '  (no odds — EV unavailable)'
 header_note = (f'LR: <{LOW} / >{HIGH}  '
                f'NN: <{nn_low} / >{nn_high}  [1u = ${UNIT}]{odds_note}')
@@ -1628,10 +1543,7 @@ deliver_picks(
 def save_game_log(df, date_str, lr_threshold_low, lr_threshold_high,
                   nn_threshold_low, nn_threshold_high,
                   lr_boundary, nn_boundary, cv_acc, cv_cov):
-    """
-    Save a detailed per-game snapshot to S3 for later result grading.
-    Includes raw model outputs, features, odds, and thresholds used.
-    """
+    """Save a detailed per-game snapshot to S3 for later result grading. Includes raw model outputs, features, odds, and thresholds used."""
     s3_bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
     if not s3_bucket:
         return
@@ -1724,8 +1636,7 @@ save_game_log(
     best[3] if best else 0.0,
 )
 
-# ── Load today's game log + picks from S3 if available ───────────────────────
-# Prefer SageMaker's run (authoritative lineups/features) over local recompute
+# ── Load today's game log + picks from S3 if available ─────────────────────── Prefer SageMaker's run (authoritative lineups/features) over local recompute
 try:
     import boto3, io as _io
     _s3 = boto3.client('s3')
@@ -1744,8 +1655,7 @@ try:
 except Exception as _ex:
     print(f'  Using locally computed game data (S3 unavailable: {_ex})')
 
-# ── SES email notification ────────────────────────────────────────────────────
-# Build email subject — include yesterday's record if available
+# ── SES email notification ──────────────────────────────────────────────────── Build email subject — include yesterday's record if available
 _yest_summary = ''
 if yesterday_log_df is not None and not yesterday_log_df.empty:
     _conf = yesterday_log_df[yesterday_log_df['lr_confident'] | yesterday_log_df['nn_confident']]

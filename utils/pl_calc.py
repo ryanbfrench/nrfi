@@ -1,12 +1,4 @@
-"""
-utils/pl_calc.py
-----------------
-P/L calculation utilities for the NRFI pipeline.
-
-Policy: P/L is ONLY computed when real odds are available.
-No -110 fallback. Games without real odds are counted as 'pending'
-in summaries and shown as '—' in the email.
-"""
+"""P/L utilities. P/L is computed only when real odds are available (no -110 fallback); games without odds are 'pending' and shown as a dash."""
 
 import pandas as pd
 import numpy as np
@@ -15,15 +7,7 @@ UNIT = 10  # dollars per unit — must match daily_picks.py
 
 
 def compute_pl(correct, pred, nrfi_odds, yrfi_odds, unit=UNIT):
-    """
-    Compute actual P/L for one graded bet.
-
-    Returns float P/L, or None if:
-      - correct is None/NaN (not yet graded)
-      - nrfi_odds or yrfi_odds is None/NaN (no real odds — no P/L without real odds)
-
-    No -110 fallback. Caller is responsible for handling None.
-    """
+    """Compute actual P/L for one graded bet. Returns float P/L, or None if: - correct is None/NaN (not yet graded) - nrfi_odds or yrfi_odds is None/NaN (no real odds — no P/L without real odds) No -110 fallback. Caller is responsible for handling None."""
     if correct is None or (isinstance(correct, float) and np.isnan(correct)):
         return None
     raw = nrfi_odds if pred == 'NRFI' else yrfi_odds
@@ -36,20 +20,7 @@ def compute_pl(correct, pred, nrfi_odds, yrfi_odds, unit=UNIT):
 
 
 def summarize_pl(results_df, model='lr', unit=UNIT):
-    """
-    Summarize P/L for a model over graded games with real odds.
-
-    Only includes rows where:
-      - model was confident (lr_confident / nn_confident == True)
-      - game is graded (lr_correct / nn_correct is not null)
-      - real odds available (nrfi_odds is not null)
-
-    pending_count: confident picks that are graded but have no real odds yet
-                  (pick was made; result known; waiting for odds backfill to count P/L)
-
-    Returns dict:
-      wins, losses, pl, roi_pct, graded_count, pending_count
-    """
+    """Summarize P/L for a model over graded games with real odds. Only includes rows where: - model was confident (lr_confident / nn_confident == True) - game is graded (lr_correct / nn_correct is not null) - real odds available (nrfi_odds is not null) pending_count: confident picks that are graded but have no real odds yet (pick was made; result known; waiting for odds backfill to count P/L) Returns dict: wins, losses, pl, roi_pct, graded_count, pending_count"""
     conf_col    = f'{model}_confident'
     correct_col = f'{model}_correct'
     pred_col    = f'{model}_pred'
@@ -100,10 +71,7 @@ def summarize_pl(results_df, model='lr', unit=UNIT):
 
 
 def running_pl_by_date(results_df, model='lr', unit=UNIT):
-    """
-    Returns list of (date_str, cumulative_pl) tuples for graded games with real odds.
-    Ordered by date ascending. Excludes games without real odds.
-    """
+    """Returns list of (date_str, cumulative_pl) tuples for graded games with real odds. Ordered by date ascending. Excludes games without real odds."""
     conf_col    = f'{model}_confident'
     correct_col = f'{model}_correct'
     pred_col    = f'{model}_pred'

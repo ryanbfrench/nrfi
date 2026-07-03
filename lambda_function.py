@@ -209,10 +209,7 @@ def main():
     except Exception as e:
         print(f'Could not load WHIP df: {e}')
 
-    # ── Pitcher first-inning RA ───────────────────────────────────────────────
-    # Primary: Fangraphs split code 44 (1st inning). If it returns data, use it.
-    # Fallback: statsapi linescore accumulation in S3 (ground-truth, always current).
-    # The S3 accumulation is updated every run regardless of which source is used.
+    # ── Pitcher first-inning RA ─────────────────────────────────────────────── Primary: Fangraphs split code 44 (1st inning). If it returns data, use it. Fallback: statsapi linescore accumulation in S3 (ground-truth, always current). The S3 accumulation is updated every run regardless of which source is used.
 
     # Primary: Fangraphs
     pitcher_runs_df = None
@@ -241,9 +238,7 @@ def main():
     except Exception as _e:
         print(f'Fangraphs split unavailable ({_e}) — using linescore fallback')
 
-    # Fallback: linescore accumulation from S3
-    # Also always loaded so the accumulation stays current even when Fangraphs is up.
-    # S3 key: pitcher_ra/{year}.json — {str(personId): {"R": int, "G": int}, "_last_date": str}
+    # Fallback: linescore accumulation from S3 Also always loaded so the accumulation stays current even when Fangraphs is up. S3 key: pitcher_ra/{year}.json — {str(personId): {"R": int, "G": int}, "_last_date": str}
     s3_client = boto3.client('s3', region_name='us-east-1')
     _ra_s3_key = f'pitcher_ra/{y}.json'
     _ra_raw = {}           # str(personId) -> {'R': int, 'G': int}
@@ -320,9 +315,7 @@ def main():
         if home_ra is None:
             home_ra = pitcher_ra_by_id.get(home_pid)
 
-        # Accumulate yesterday's first-inning runs for the linescore fallback.
-        # Home starter faces away batters in the TOP of the 1st → top1 is their runs allowed.
-        # Away starter faces home batters in the BOTTOM of the 1st → bot1 is their runs allowed.
+        # Accumulate yesterday's first-inning runs for the linescore fallback. Home starter faces away batters in the TOP of the 1st → top1 is their runs allowed. Away starter faces home batters in the BOTTOM of the 1st → bot1 is their runs allowed.
         for _pid, _r in [(str(home_pid), top1), (str(away_pid), bot1)]:
             if _pid not in pitcher_ra_updates:
                 pitcher_ra_updates[_pid] = {'R': 0, 'G': 0}

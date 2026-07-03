@@ -1,22 +1,4 @@
-"""
-utils/odds_backfill.py
-----------------------
-Targeted historical odds backfill for confident picks missing real odds.
-
-Called from grade_yesterday() in daily_picks.py after grading actuals.
-Only fetches dates where confident picks have null nrfi_odds/yrfi_odds.
-Uses S3 odds cache (odds/{year}/{date}.json) — same format as daily
-fetch_odds() and backfill_odds_2025.py. Never re-fetches a cached date.
-
-API: The Odds API historical endpoint (separate key from live key).
-Env var: HISTORICAL_ODDS_API_KEY
-
-Key behaviors:
-  - Skips dates already cached in S3
-  - Stops early if x-requests-remaining drops below STOP_THRESHOLD
-  - Handles doubleheaders by assigning odds in commence_time order
-  - Fails silently: errors are logged, original df returned unchanged
-"""
+"""utils/odds_backfill.py ---------------------- Targeted historical odds backfill for confident picks missing real odds. Called from grade_yesterday() in daily_picks.py after grading actuals. Only fetches dates where confident picks have null nrfi_odds/yrfi_odds. Uses S3 odds cache (odds/{year}/{date}.json) — same format as daily fetch_odds() and backfill_odds_2025.py. Never re-fetches a cached date. API: The Odds API historical endpoint (separate key from live key). Env var: HISTORICAL_ODDS_API_KEY Key behaviors: - Skips dates already cached in S3 - Stops early if x-requests-remaining drops below STOP_THRESHOLD - Handles doubleheaders by assigning odds in commence_time order - Fails silently: errors are logged, original df returned unchanged"""
 
 import json
 import time
@@ -65,13 +47,7 @@ def _load_cached(s3_client, bucket, date_str):
 
 
 def _fetch_and_cache(s3_client, bucket, date_str, api_key):
-    """
-    Fetch NRFI/YRFI odds for date_str from the historical API and cache to S3.
-
-    Returns (events_list, last_requests_remaining).
-    events_list may be empty on API failure — the empty list is still cached
-    to skip this date on future runs.
-    """
+    """Fetch NRFI/YRFI odds for date_str from the historical API and cache to S3. Returns (events_list, last_requests_remaining). events_list may be empty on API failure — the empty list is still cached to skip this date on future runs."""
     snapshot       = f'{date_str}T{SNAPSHOT_HOUR}'
     last_remaining = None
     results        = []
@@ -137,13 +113,7 @@ def _fetch_and_cache(s3_client, bucket, date_str, api_key):
 
 
 def _parse_odds_from_events(events):
-    """
-    Parse a list of event odds dicts into: {'AWAY@HOME': (nrfi_odds, yrfi_odds)}.
-
-    Doubleheader handling: if two events share the same AWAY@HOME matchup key,
-    the one with the earlier commence_time is treated as game 1 and assigned
-    first. Game 2 is skipped (odds for doubleheader game 2 are rare/unreliable).
-    """
+    """Parse a list of event odds dicts into: {'AWAY@HOME': (nrfi_odds, yrfi_odds)}. Doubleheader handling: if two events share the same AWAY@HOME matchup key, the one with the earlier commence_time is treated as game 1 and assigned first. Game 2 is skipped (odds for doubleheader game 2 are rare/unreliable)."""
     if not events:
         return {}
 
@@ -188,28 +158,7 @@ def _parse_odds_from_events(events):
 
 
 def backfill_missing_odds(results_df, s3_client, bucket, hist_api_key):
-    """
-    For confident picks in results_df with null nrfi_odds, fetch real odds
-    from S3 cache (or historical API if not cached) and fill them in.
-
-    Args:
-        results_df:    The combined results DataFrame from grade_yesterday()
-        s3_client:     boto3 S3 client
-        bucket:        S3 bucket name (e.g. 'nrfi-store')
-        hist_api_key:  The Odds API historical key
-                       (env var: HISTORICAL_ODDS_API_KEY)
-
-    Returns:
-        Updated DataFrame with nrfi_odds/yrfi_odds filled where found.
-        Returns original df unchanged on any error.
-
-    Behaviors:
-        - S3-cached dates are always used regardless of hist_api_key
-        - hist_api_key is only needed to fetch dates not already in S3 cache
-        - If API quota drops below STOP_THRESHOLD, stops processing further dates
-        - Remaining unfilled rows keep null odds (P/L excluded until next run)
-        - Never raises an exception
-    """
+    """For confident picks in results_df with null nrfi_odds, fetch real odds from S3 cache (or historical API if not cached) and fill them in. Args: results_df: The combined results DataFrame from grade_yesterday() s3_client: boto3 S3 client bucket: S3 bucket name (e.g. 'nrfi-store') hist_api_key: The Odds API historical key (env var: HISTORICAL_ODDS_API_KEY) Returns: Updated DataFrame with nrfi_odds/yrfi_odds filled where found. Returns original df unchanged on any error. Behaviors: - S3-cached dates are always used regardless of hist_api_key - hist_api_key is only needed to fetch dates not already in S3 cache - If API quota drops below STOP_THRESHOLD, stops processing further dates - Remaining unfilled rows keep null odds (P/L excluded until next run) - Never raises an exception"""
     from utils.logger import log
 
     if results_df is None or results_df.empty:

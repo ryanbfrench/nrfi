@@ -1,9 +1,4 @@
-"""
-utils/email_html.py
--------------------
-build_email_html  — full daily email HTML
-send_email        — SES delivery (with optional inline chart image)
-"""
+"""build_email_html (full daily email HTML) and send_email (SES delivery, optional inline chart)."""
 
 import os
 from datetime import datetime, timedelta
@@ -28,16 +23,7 @@ def _pl_str(pl):
 def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
                      lr_band, nn_band, cv_acc, cv_cov,
                      *, yesterday, today, unit, get_odds_fn=None):
-    """
-    Full daily email HTML.
-
-    Extra keyword args (must be passed explicitly):
-      yesterday    — date object for yesterday
-      today        — date object for today
-      unit         — dollar value per unit (e.g. 10)
-      get_odds_fn  — callable(matchup) -> (nrfi_odds, yrfi_odds) | None
-                     Pass None to suppress live odds lookup (shows — in table)
-    """
+    """Full daily email HTML. Extra keyword args (must be passed explicitly): yesterday — date object for yesterday today — date object for today unit — dollar value per unit (e.g. 10) get_odds_fn — callable(matchup) -> (nrfi_odds, yrfi_odds) | None Pass None to suppress live odds lookup (shows — in table)"""
     G    = '#2563eb'
     R    = '#7c3aed'
     WIN  = '#16a34a'
@@ -283,6 +269,91 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
         picks_section      = ''
         not_picked_section = ''
 
+    # ── Data quality (today's slate) ────────────────────────────────────────── Mirrors daily_picks.print_data_quality_report, which otherwise only reaches the SageMaker logs. Reads whichever dq column naming today_df_all carries: the locally built frame uses `_dq_*`, an S3-reloaded game_log uses `dq_*`.
+    def dq_section():
+        df = today_df_all
+        if df is None or df.empty:
+            return ''
+        AMBER = '#b45309'
+
+        def col(base):
+            for name in (f'_dq_{base}', f'dq_{base}'):
+                if name in df.columns:
+                    return df[name]
+            return None
+
+        def is_true(s):
+            return s.astype(str).str.lower().isin(['true', '1', '1.0'])
+
+        n = len(df)
+        n_imp = col('n_imputed')
+        if n_imp is None:
+            return ''   # no dq instrumentation on this frame
+        n_imp = pd.to_numeric(n_imp, errors='coerce').fillna(0)
+        avg_imp = n_imp.mean()
+
+        # source/flag rollups
+        rows = []
+        ra_cnt = sum(int(is_true(c).sum()) for c in
+                     [col('home_ra_imp'), col('away_ra_imp')] if c is not None)
+        whip_cnt = sum(int(is_true(c).sum()) for c in
+                       [col('home_whip_imp'), col('away_whip_imp')] if c is not None)
+        rows.append(('Starter RA imputed',   f'{ra_cnt}/{2*n}',   ra_cnt > n))
+        rows.append(('Starter WHIP imputed', f'{whip_cnt}/{2*n}', whip_cnt > n))
+
+        def src_breakdown(bases, order):
+            counts = {}
+            for b in bases:
+                c = col(b)
+                if c is None:
+                    continue
+                for v in c.astype(str):
+                    counts[v] = counts.get(v, 0) + 1
+            if not counts:
+                return None
+            ordered = sorted(counts.items(),
+                             key=lambda kv: order.index(kv[0]) if kv[0] in order else 99)
+            return '  '.join(f'{k}={v}' for k, v in ordered)
+
+        ops_str = src_breakdown(['home_ops_src', 'away_ops_src'],
+                                ['lineup', 'yesterday', 'team_avg', 'league'])
+        if ops_str:
+            # warn when most OPS values are a fallback (team_avg/league), not real lineups
+            fb = sum(int((col(b).astype(str).isin(['team_avg', 'league'])).sum())
+                     for b in ['home_ops_src', 'away_ops_src'] if col(b) is not None)
+            rows.append(('OPS source', ops_str, fb > n))
+        yrfi_str = src_breakdown(['home_yrfi_src', 'away_yrfi_src'],
+                                 ['current', 'prior', 'overall', 'league'])
+        if yrfi_str:
+            rows.append(('YRFI% source', yrfi_str, False))
+        wsrc = col('weather_src')
+        if wsrc is not None:
+            api = int((wsrc.astype(str) == 'api').sum())
+            rows.append(('Weather', f'api={api}  default={n - api}', api == 0))
+
+        tbl = ''.join(
+            f'<tr>{td(label)}{td(val, right=True, color=(AMBER if warn else None), bold=warn)}</tr>'
+            for label, val, warn in rows
+        )
+        summary = (f'<div style="font-size:13px;margin-bottom:12px">'
+                   f'{n} games &nbsp;&middot;&nbsp; '
+                   f'<b>{avg_imp:.1f}</b> features imputed/game avg</div>')
+        table = (f'<table style="width:100%;border-collapse:collapse">'
+                 f'<tr>{th("source")}{th("today", right=True)}</tr>{tbl}</table>')
+
+        # name the games most reliant on league averages
+        high = []
+        if 'matchup' in df.columns:
+            high = list(df.loc[n_imp >= 3, 'matchup'].astype(str))
+        note = ''
+        if high:
+            note = (f'<div style="font-size:12px;color:{AMBER};margin-top:10px">'
+                    f'High imputation (&ge;3 features) &mdash; predictions lean on league '
+                    f'averages: <b>{", ".join(high)}</b></div>')
+        return section('Data Quality', summary + table + note)
+
+    dq_section_html = dq_section()
+
     # ── Assemble ──────────────────────────────────────────────────────────────
     u = datetime.utcnow()
     offset  = -4 if 3 <= u.month <= 10 else -5
@@ -311,6 +382,7 @@ def build_email_html(date_str, picks_rows, yesterday_rows, ytd_df, today_df_all,
   <!-- THRESHOLD_CHART_PLACEHOLDER -->
   {picks_section}
   {not_picked_section}
+  {dq_section_html}
 
   <div style="margin-top:32px;padding-top:12px;border-top:1px solid {BDR};
               font-size:11px;color:{MUT};text-align:center">
