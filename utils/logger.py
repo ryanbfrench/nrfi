@@ -30,7 +30,7 @@ def log(level, msg, **ctx):
 
 
 def metric(name, value, unit='Count', dimensions=None):
-    """Emit a CloudWatch custom metric under the NRFI/Pipeline namespace. Uses daily StorageResolution (86400s) to minimize cost. PutMetricData does not support resource-level IAM restrictions — the SageMaker/Lambda role must have cloudwatch:PutMetricData on "*". Args: name: Metric name (e.g. 'LRPickCount') value: Numeric value unit: CloudWatch unit string (default 'Count') Common: 'Count', 'None', 'Dollars', 'Percent' dimensions: Optional dict of {Name: Value} dimension pairs (e.g. {'Model': 'LR'}) Fails silently — never crashes the pipeline."""
+    """Emit a CloudWatch custom metric under the NRFI/Pipeline namespace. Standard (60s) storage resolution — CloudWatch only accepts 1 or 60, there is no daily tier. PutMetricData does not support resource-level IAM restrictions — the SageMaker/Lambda role must have cloudwatch:PutMetricData on "*". Args: name: Metric name (e.g. 'LRPickCount') value: Numeric value unit: CloudWatch unit string (default 'Count') Common: 'Count', 'None', 'Dollars', 'Percent' dimensions: Optional dict of {Name: Value} dimension pairs (e.g. {'Model': 'LR'}) Fails silently — never crashes the pipeline."""
     cw = _get_cw()
     if cw is None:
         return
@@ -39,12 +39,11 @@ def metric(name, value, unit='Count', dimensions=None):
         cw.put_metric_data(
             Namespace=CW_NAMESPACE,
             MetricData=[{
-                'MetricName':       name,
-                'Value':            float(value),
-                'Unit':             unit,
-                'Dimensions':       dims,
-                'Timestamp':        datetime.now(timezone.utc),
-                'StorageResolution': 86400,  # daily resolution — lowest cost tier
+                'MetricName': name,
+                'Value':      float(value),
+                'Unit':       unit,
+                'Dimensions': dims,
+                'Timestamp':  datetime.now(timezone.utc),
             }]
         )
     except Exception as ex:
