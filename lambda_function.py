@@ -108,7 +108,26 @@ def parse_weather(weather_str, first_pitch_str):
     return temp, day_night, clear, cloudy, rain, dome
 
 
+def fetch_team_pct(yesterday):
+    """Scrape the teamrankings YRFI table. Returns the DataFrame, or None if the site is unreachable / returns a blank body. teamrankings intermittently serves an empty document to AWS egress IPs, which made a bare pd.read_html raise XMLSyntaxError and abort the whole collection run (2026-08-02/03). YRFI pct is only two feature columns — the realized YRFI outcome comes from statsapi — so a failure here must degrade, never abort."""
+    url = f'https://www.teamrankings.com/mlb/stat/yes-run-first-inning-pct?date={yesterday}'
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            if '<table' not in resp.text:
+                raise ValueError(f'blank body ({len(resp.text)} bytes, no <table>)')
+            return pd.read_html(resp.text)[0]
+        except Exception as e:
+            print(f'teamrankings attempt {attempt + 1}/3 failed: {e}')
+    print('WARNING: teamrankings unavailable — yrfi_pct will be null for this day')
+    return None
+
+
 def get_yrfi_split(team_pct, team_name, split_col, year_col):
+    if team_pct is None:
+        return None
     row = team_pct[team_pct['Team'] == team_name]
     if row.empty:
         return None
@@ -118,7 +137,7 @@ def get_yrfi_split(team_pct, team_name, split_col, year_col):
     return v
 
 
-def main():
+def main(run_date=None, save_ra=True):
     team_abbvs = {
         'PHI': {'team_pct': 'Philadelphia', 'normal': 'PHI'},
         'SF':  {'team_pct': 'SF Giants',    'normal': 'SF'},
@@ -162,7 +181,8 @@ def main():
         'NYM':  96, 'STL':  95, 'OAK':  94, 'SD':   94, 'SEA':  91,
     }
 
-    date = datetime.date.today()
+    # run_date is the date the collector runs; it always collects the day before. Parameterized so a missed day can be re-collected (scripts/grade_backfill.py).
+    date = run_date or datetime.date.today()
     yesterday = date - datetime.timedelta(1)
     y = yesterday.year
 
@@ -257,9 +277,7 @@ def main():
         print(f'S3 linescore RA unavailable ({_e}) — run utils/backfill_pitcher_ra.py')
     pitcher_ra_updates = {}  # str(personId) -> {'R': int, 'G': int} for yesterday's games
 
-    team_pct = pd.read_html(
-        f'https://www.teamrankings.com/mlb/stat/yes-run-first-inning-pct?date={yesterday}'
-    )[0]
+    team_pct = fetch_team_pct(yesterday)
     year_col = str(y)
 
     # ── Game loop ─────────────────────────────────────────────────────────────
@@ -371,15 +389,19 @@ def main():
         _ra_raw[_pid]['R'] += _upd['R']
         _ra_raw[_pid]['G'] += _upd['G']
     _ra_raw['_last_date'] = str(yesterday)
-    try:
-        s3_client.put_object(
-            Bucket='nrfi-store', Key=_ra_s3_key,
-            Body=json.dumps(_ra_raw).encode('utf-8'),
-            ContentType='application/json',
-        )
-        print(f'Saved first-inn pitcher RA ({len(_ra_raw) - 1} pitchers) to S3')
-    except Exception as _e:
-        print(f'Warning: could not save pitcher RA to S3 ({_e})')
+    if not save_ra:
+        # Backfill/replay path: the accumulator is additive, so re-collecting a day that was already merged would double-count its R and G.
+        print('Skipping pitcher RA save (save_ra=False)')
+    else:
+        try:
+            s3_client.put_object(
+                Bucket='nrfi-store', Key=_ra_s3_key,
+                Body=json.dumps(_ra_raw).encode('utf-8'),
+                ContentType='application/json',
+            )
+            print(f'Saved first-inn pitcher RA ({len(_ra_raw) - 1} pitchers) to S3')
+        except Exception as _e:
+            print(f'Warning: could not save pitcher RA to S3 ({_e})')
 
     big_df = pd.DataFrame(day_rows).reset_index(drop=True)
     return big_df, yesterday
