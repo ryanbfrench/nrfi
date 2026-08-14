@@ -356,9 +356,9 @@ def main(run_date=None, save_ra=True):
 
         day_rows.append({
             'id':              row_id,
-            'year':            date.year,
-            'month':           date.month,
-            'day':             date.day,
+            'year':            yesterday.year,
+            'month':           yesterday.month,
+            'day':             yesterday.day,
             '1st_runs':        first_inn_runs,
             'YRFI':            1 if first_inn_runs > 0 else 0,
             'away_lineup':     away_lineup,

@@ -6,7 +6,7 @@ import pandas as pd
 # ── Modeling constants (single source — daily_picks.py and the backfill import these) ──
 FEATURES = ['away_ops', 'home_ops', 'home_yrfi_pct', 'away_yrfi_pct',
             'home_pitcher_ra', 'home_whip', 'away_pitcher_ra', 'away_whip',
-            'park_factor', 'temp', 'rain']
+            'park_factor', 'temp']
 
 RECENCY_HALF_LIFE  = 365     # days; games 1yr old carry ~37% weight
 RA_CAP             = 1.5     # cap extreme small-sample RA before imputing zeros
@@ -83,19 +83,23 @@ def april15_filter(df_raw):
                     ((df_raw['month'] == 4) & (df_raw['day'] < 15)))].copy()
 
 def impute_training(df, *, ra_cap=RA_CAP):
-    """Impute zero-sentinels in place-ish (returns the frame) and the league averages used. RA=0 / WHIP=0 / YRFI%=0 mean 'no data' (debut / early season) — fill with league medians/means. RA is also capped before the zero-fill so extreme small-sample values don't dominate. Mirrors daily_picks.py PART 1 exactly."""
+    """Impute missing values (returns the frame) and the league averages used. RA=0 / WHIP=0 / YRFI%=0 mean 'no data' (debut / early season) — fill with league medians/means. RA is also capped before the zero-fill so extreme small-sample values don't dominate. Mirrors daily_picks.py PART 1 exactly.
+
+    NaN is treated as the same 'no data' signal as the 0 sentinel. The 2021-2025 base corpus has no NaNs, so a `.replace(0, ...)` alone was sufficient for years — but the Lambda daily files write NaN (not 0) when a stat is unavailable, and ~30% of 2026 rows have a null pitcher_ra. Once the current season is appended to training (2026-08-14) an un-filled NaN reaches LogisticRegression.fit and raises."""
     league = {
         'ra':   float(df[df['away_pitcher_ra'] > 0]['away_pitcher_ra'].median()),
         'whip': float(df[df['home_whip'] > 0]['home_whip'].median()),
         'yrfi': float(df[df['home_yrfi_pct'] > 0]['home_yrfi_pct'].mean()),
         'ops':  float(df['home_ops'].median()),
     }
-    df['away_pitcher_ra'] = df['away_pitcher_ra'].clip(upper=ra_cap).replace(0, league['ra'])
-    df['home_pitcher_ra'] = df['home_pitcher_ra'].clip(upper=ra_cap).replace(0, league['ra'])
-    df['away_whip']       = df['away_whip'].replace(0, league['whip'])
-    df['home_whip']       = df['home_whip'].replace(0, league['whip'])
-    df['home_yrfi_pct']   = df['home_yrfi_pct'].replace(0, league['yrfi'])
-    df['away_yrfi_pct']   = df['away_yrfi_pct'].replace(0, league['yrfi'])
+    df['away_pitcher_ra'] = df['away_pitcher_ra'].clip(upper=ra_cap).replace(0, league['ra']).fillna(league['ra'])
+    df['home_pitcher_ra'] = df['home_pitcher_ra'].clip(upper=ra_cap).replace(0, league['ra']).fillna(league['ra'])
+    df['away_whip']       = df['away_whip'].replace(0, league['whip']).fillna(league['whip'])
+    df['home_whip']       = df['home_whip'].replace(0, league['whip']).fillna(league['whip'])
+    df['home_yrfi_pct']   = df['home_yrfi_pct'].replace(0, league['yrfi']).fillna(league['yrfi'])
+    df['away_yrfi_pct']   = df['away_yrfi_pct'].replace(0, league['yrfi']).fillna(league['yrfi'])
+    df['away_ops']        = df['away_ops'].replace(0, league['ops']).fillna(league['ops'])
+    df['home_ops']        = df['home_ops'].replace(0, league['ops']).fillna(league['ops'])
     return df, league
 
 def recency_weights(df, today, *, half_life=RECENCY_HALF_LIFE):

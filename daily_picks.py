@@ -124,7 +124,8 @@ STADIUM_COORDS = {
     'LAA': (33.8003, -117.8827), 'LAD': (34.0739, -118.2400),
     'MIA': (25.7781,  -80.2197), 'MIL': (43.0280,  -87.9712),
     'MIN': (44.9817,  -93.2776), 'NYM': (40.7571,  -73.8458),
-    'NYY': (40.8296,  -73.9262), 'OAK': (37.7516, -122.2005),
+    # 'OAK' = Sutter Health Park, West Sacramento
+    'NYY': (40.8296,  -73.9262), 'OAK': (38.5802, -121.5133),
     'PHI': (39.9061,  -75.1665), 'PIT': (40.4469,  -80.0057),
     'SD':  (32.7076, -117.1570), 'SF':  (37.7786, -122.3893),
     'SEA': (47.5914, -122.3325), 'STL': (38.6226,  -90.1928),
@@ -180,24 +181,52 @@ def load_data(path):
 
 
 # ── Weather (Open-Meteo, free, no API key required) ───────────────────────────
-def fetch_weather(abbv, target_date):
-    """Return (temp_F, rain, source) for a team's home stadium on target_date. source is 'api' when live data was fetched, 'default' when fallback values are used."""
+# Must return FIRST-PITCH temperature, not the daily maximum. The training corpus takes `temp`
+# from the MLB boxscore "Weather" line (lambda_function.parse_weather) = the temperature actually
+# reported at the park at game time. Requesting `daily=temperature_2m_max` fed a different
+# variable: measured against the Open-Meteo archive over 6 parks (Aug 5-11 2026), daily max runs
+# +6.7F above the 19:00 local temperature (LAD +12.6, NYY +7.7, BOS +6.1, COL +3.8). Because the
+# diurnal swing widens through the summer, the live-vs-training gap grew Apr +5.3 -> Aug +9.2F,
+# which pushed every August game's YRFI probability up and inflated LR coverage to 46%. Hourly
+# temperature at the game's local start hour is the like-for-like analogue of the boxscore value.
+def fetch_weather(abbv, target_date, first_pitch_utc=None):
+    """Return (temp_F, rain, source) for a team's home stadium at first pitch on target_date. `first_pitch_utc` is an ISO-8601 UTC string (statsapi `game_datetime`); when it is missing we fall back to 19:00 stadium-local, the modal MLB start. `rain` is precipitation over the 3h game window — kept for the game_log/DQ only, it is NOT a model feature (see FEATURES). source is 'api' on a live fetch, 'default' on any failure."""
     coords = STADIUM_COORDS.get(abbv)
     if coords is None:
         return 65, 0, 'default'
     lat, lon = coords
     try:
+        # Pull a 2-day hourly window so a late local start that rolls past midnight still resolves.
+        end_date = (datetime.fromisoformat(str(target_date)).date() + timedelta(days=1)).isoformat()
         url = (
             f'https://api.open-meteo.com/v1/forecast'
             f'?latitude={lat}&longitude={lon}'
-            f'&daily=temperature_2m_max,precipitation_sum'
+            f'&hourly=temperature_2m,precipitation'
             f'&temperature_unit=fahrenheit'
             f'&timezone=auto'
-            f'&start_date={target_date}&end_date={target_date}'
+            f'&start_date={target_date}&end_date={end_date}'
         )
-        data = requests.get(url, timeout=10).json()['daily']
-        temp = round(data['temperature_2m_max'][0])
-        rain = 1 if data['precipitation_sum'][0] > 0.5 else 0
+        payload = requests.get(url, timeout=10).json()
+        hourly  = payload['hourly']
+        times   = hourly['time']                       # ISO strings in STADIUM-local time
+        temps   = hourly['temperature_2m']
+        precip  = hourly['precipitation']
+
+        # Convert first pitch to stadium-local using the offset Open-Meteo resolved for this lat/lon,
+        # so we never need a local tz database.
+        offset = int(payload.get('utc_offset_seconds', 0))
+        if first_pitch_utc:
+            local_dt = (datetime.fromisoformat(str(first_pitch_utc).replace('Z', '+00:00'))
+                        + timedelta(seconds=offset))
+            stamp = local_dt.strftime('%Y-%m-%dT%H:00')
+        else:
+            stamp = f'{target_date}T19:00'
+        idx = times.index(stamp) if stamp in times else times.index(f'{target_date}T19:00')
+
+        temp = round(temps[idx])
+        # Rain over first pitch + 3h (covers well beyond the 1st inning this model cares about).
+        window = [p for p in precip[idx:idx + 3] if p is not None]
+        rain = 1 if sum(window) > 0.5 else 0
         return temp, rain, 'api'
     except Exception:
         return 65, 0, 'default'
@@ -643,7 +672,65 @@ print('=' * 60)
 print(f'DAILY PICKS  {TODAY}')
 print('=' * 60)
 
+def load_season_games(year, bucket='nrfi-store'):
+    """Read every Lambda daily file under data/{year}/ and return them as training rows.
+
+    These are the SAME rows the historical corpus is built from — lambda_function writes the full
+    training schema post-game, with `temp` off the boxscore Weather line and YRFI off the real
+    linescore — so they can be concatenated with DATA_PATH directly.
+
+    Rebuilt from S3 on every run rather than appended to a running file on purpose: there is no
+    accumulator state to corrupt, so a bad or missing day self-heals on the next run instead of
+    poisoning the corpus permanently (the failure mode that silently emptied the pitcher_ra file).
+
+    Dates come from `id` (always the game date), NOT the stored year/month/day: the collector runs
+    the morning after and stamped those with the RUN date until 2026-08-14, leaving existing rows
+    one day ahead. Returns an empty frame on any failure — a season append must never be fatal.
+    """
+    try:
+        import boto3, io
+        s3 = boto3.client('s3')
+        keys = []
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=f'data/{year}/'):
+            keys += [o['Key'] for o in page.get('Contents', []) if o['Key'].endswith('.txt')]
+        frames = []
+        for k in keys:
+            try:
+                frames.append(pd.read_csv(io.BytesIO(
+                    s3.get_object(Bucket=bucket, Key=k)['Body'].read())))
+            except Exception:
+                continue
+        if not frames:
+            return pd.DataFrame()
+        season = pd.concat(frames, ignore_index=True)
+        season = season.drop_duplicates(subset='id', keep='last')
+        gd = pd.to_datetime(season['id'].astype(str).str.slice(0, 10), errors='coerce')
+        season = season[gd.notna()].copy()
+        gd = gd[gd.notna()]
+        season['year'], season['month'], season['day'] = gd.dt.year, gd.dt.month, gd.dt.day
+        return season
+    except Exception as ex:
+        print(f'  WARNING: could not load {year} season games ({ex}) — training on base corpus only')
+        return pd.DataFrame()
+
+
 _df_raw = load_data(DATA_PATH)
+_base_n = len(_df_raw)
+
+# Un-freeze the training corpus (2026-08-14). DATA_PATH is a static 2021-2025 file, so until now
+# the LR was refit every day on a corpus that never grew — it never saw a single 2026 game, and
+# its scaler/coefficients stayed calibrated to a distribution the live feed had drifted away from.
+# (The NN was fine: it gets the A+B+C incremental update off the same daily files.)
+_season = load_season_games(TODAY.year)
+if not _season.empty:
+    _cols = [c for c in _df_raw.columns if c in _season.columns]
+    _df_raw = pd.concat([_df_raw, _season[_cols]], ignore_index=True)
+    _df_raw = _df_raw.drop_duplicates(subset='id', keep='last')
+    print(f'Training corpus: {_base_n} base + {len(_df_raw) - _base_n} from {TODAY.year} '
+          f'= {len(_df_raw)} games')
+else:
+    print(f'Training corpus: {_base_n} games (no {TODAY.year} season files found)')
 
 # Exclude pre-April-15 games from training: pitcher RA and YRFI pct are unreliable before mid-April (Fangraphs splits need innings to accumulate; teamrankings YRFI% is based on 0-2 games and often reads as 0%).
 df = _df_raw[~((_df_raw['month'] < 4) | ((_df_raw['month'] == 4) & (_df_raw['day'] < 15)))].copy()
@@ -653,17 +740,26 @@ print(f'Training set after April-15 filter: {len(df)} games '
 league_avg_ra   = df[df['away_pitcher_ra'] > 0]['away_pitcher_ra'].median()
 league_avg_whip = df[df['home_whip'] > 0]['home_whip'].median()
 league_avg_yrfi = df[df['home_yrfi_pct'] > 0]['home_yrfi_pct'].mean()
+league_avg_ops  = df['home_ops'].median()
 RA_CAP = 1.5  # cap extreme small-sample RA values before imputing zeros
-df['away_pitcher_ra'] = df['away_pitcher_ra'].clip(upper=RA_CAP).replace(0, league_avg_ra)
-df['home_pitcher_ra'] = df['home_pitcher_ra'].clip(upper=RA_CAP).replace(0, league_avg_ra)
-df['away_whip']       = df['away_whip'].replace(0, league_avg_whip)
-df['home_whip']       = df['home_whip'].replace(0, league_avg_whip)
-df['home_yrfi_pct']   = df['home_yrfi_pct'].replace(0, league_avg_yrfi)
-df['away_yrfi_pct']   = df['away_yrfi_pct'].replace(0, league_avg_yrfi)
+# NaN means the same thing as the 0 sentinel here ('no data'). The 2021-2025 base corpus has no
+# nulls, so `.replace(0, ...)` alone sufficed — but the Lambda daily files write NaN when a stat
+# is unavailable (~30% of 2026 rows have a null pitcher_ra), and those rows are now part of
+# training, so an unfilled NaN would reach LogisticRegression.fit and raise. Mirrors
+# picks_engine.impute_training.
+df['away_pitcher_ra'] = df['away_pitcher_ra'].clip(upper=RA_CAP).replace(0, league_avg_ra).fillna(league_avg_ra)
+df['home_pitcher_ra'] = df['home_pitcher_ra'].clip(upper=RA_CAP).replace(0, league_avg_ra).fillna(league_avg_ra)
+df['away_whip']       = df['away_whip'].replace(0, league_avg_whip).fillna(league_avg_whip)
+df['home_whip']       = df['home_whip'].replace(0, league_avg_whip).fillna(league_avg_whip)
+df['home_yrfi_pct']   = df['home_yrfi_pct'].replace(0, league_avg_yrfi).fillna(league_avg_yrfi)
+df['away_yrfi_pct']   = df['away_yrfi_pct'].replace(0, league_avg_yrfi).fillna(league_avg_yrfi)
+df['away_ops']        = df['away_ops'].replace(0, league_avg_ops).fillna(league_avg_ops)
+df['home_ops']        = df['home_ops'].replace(0, league_avg_ops).fillna(league_avg_ops)
 
+# `rain` was dropped 2026-08-14. Live set it from Open-Meteo `precipitation_sum > 0.5` — total mm over the whole CALENDAR DAY — while the training corpus set it from the boxscore Weather string ("rain"/"drizzle"/"shower"), i.e. the game actually being played in rain. Result: 20.7% of live games flagged vs 1.0% of training rows, with the outcome sign flipped (training rain -> 47.7% YRFI, live -> 52.6%). The two sides were not the same variable, so the coefficient was meaningless.
 FEATURES = ['away_ops', 'home_ops', 'home_yrfi_pct', 'away_yrfi_pct',
             'home_pitcher_ra', 'home_whip', 'away_pitcher_ra', 'away_whip',
-            'park_factor', 'temp', 'rain']
+            'park_factor', 'temp']
 
 def make_features(d):
     e = pd.DataFrame(index=d.index)
@@ -677,7 +773,6 @@ def make_features(d):
     e['away_whip']       = d['away_whip']
     e['park_factor']     = d['park_factor']
     e['temp']            = d['temp']
-    e['rain']            = d['rain']
     return e[FEATURES]
 
 X_raw = make_features(df).values
@@ -714,6 +809,14 @@ def _load_nn_from_s3(s3_path, input_dim):
     obj  = boto3.client('s3').get_object(Bucket=bucket, Key=key)
     data = np.load(io.BytesIO(obj['Body'].read()), allow_pickle=False)
     weights = [data[f'arr_{i}'] for i in range(len(data.files))]
+    # Explicit feature-count guard. set_weights would raise on its own, but with an opaque
+    # layer-shape message; a FEATURES change (e.g. dropping `rain`, 2026-08-14) legitimately
+    # invalidates the persisted weights and must fall through to a scratch retrain, so say so.
+    saved_dim = weights[0].shape[0] if weights else None
+    if saved_dim is not None and saved_dim != input_dim:
+        raise ValueError(
+            f'saved NN expects {saved_dim} features but FEATURES now has {input_dim} — '
+            f'feature set changed, weights are not transferable')
     model = _build_nn(input_dim)
     model.set_weights(weights)
     return model
@@ -807,6 +910,7 @@ nn_boundary = y.mean()
 uses_s3 = NN_MODEL_PATH.startswith('s3://')
 
 nn = None
+_nn_from_scratch = False   # set when the persisted weights are unusable and we refit from zero
 if uses_s3 and _s3_model_exists(NN_MODEL_PATH):
     print(f'\nLoading NN from {NN_MODEL_PATH}...')
     try:
@@ -872,6 +976,7 @@ if nn is not None:
             print(f'  NN saved to {NN_MODEL_PATH} (unchanged)')
 else:
     print('\nNo saved NN found — training from scratch on full dataset...')
+    _nn_from_scratch = True
     nn = _build_nn(X_nn_all.shape[1])
     es = tf.keras.callbacks.EarlyStopping(
         monitor='val_loss', patience=10, restore_best_weights=True, verbose=0
@@ -890,7 +995,25 @@ nn_meta   = {'boundary': nn_calibrated_boundary}
 # NN confidence band: PERCENTILE of recent live outputs (rolling NN_POOL_DAYS window), targeting NN_COVERAGE_TARGET coverage on the distribution actually being scored. A fixed CV margin undershot deployment coverage badly (the live outputs are shifted/ compressed vs historical CV). If the rolling pool is too small (early season / no OUTPUT_BUCKET), fall back to a symmetric margin around the calibrated boundary.
 _nn_pool = _recent_nn_pool(TODAY, NN_POOL_DAYS)
 _tail    = NN_COVERAGE_TARGET / 2.0
-if len(_nn_pool) >= NN_POOL_MIN:
+
+# A from-scratch refit produces a DIFFERENT output distribution than the model whose outputs are
+# sitting in the pool, so the pooled percentiles describe a model that no longer exists. Calibrate
+# off the new model's own outputs for this run instead. The live pool refills as new days land;
+# it stays mixed for up to NN_POOL_DAYS, which is self-correcting but worth knowing when reading
+# NN coverage in that window.
+if _nn_from_scratch and len(_nn_pool):
+    print(f'  NOTE: discarding {len(_nn_pool)} pooled outputs — they came from the previous '
+          f'model, which was just refit from scratch. Pool will be mixed for ≤{NN_POOL_DAYS}d.')
+    _nn_pool = np.array([])
+
+if _nn_from_scratch:
+    _self = nn.predict(X_nn_all, verbose=0).ravel()
+    nn_low  = round(float(np.percentile(_self, _tail * 100)), 4)
+    nn_high = round(float(np.percentile(_self, (1 - _tail) * 100)), 4)
+    print(f'NN band (percentile of the new model\'s own {len(_self)} training outputs):  '
+          f'<{nn_low} / >{nn_high}  (target {NN_COVERAGE_TARGET:.0%}, '
+          f'boundary {nn_calibrated_boundary:.4f})')
+elif len(_nn_pool) >= NN_POOL_MIN:
     nn_low  = round(float(np.percentile(_nn_pool, _tail * 100)), 4)
     nn_high = round(float(np.percentile(_nn_pool, (1 - _tail) * 100)), 4)
     _cov_chk = float((_nn_pool < nn_low).mean() + (_nn_pool > nn_high).mean())
@@ -1237,13 +1360,15 @@ def fetch_game_ops(game_id, away_abbv, home_abbv, away_team_id=None, home_team_i
 
 # ── 4c. Weather (Open-Meteo) ──────────────────────────────────────────────────
 print('Fetching weather from Open-Meteo...')
+# Keyed by (stadium, first pitch) rather than stadium alone: temperature is now read at the game's
+# start hour, so the two halves of a doubleheader legitimately get different values.
 WEATHER_CACHE = {}
 for g in games:
-    home = g['home_abbv']
-    if home not in WEATHER_CACHE:
-        WEATHER_CACHE[home] = fetch_weather(home, str(TODAY))
+    key = (g['home_abbv'], g.get('game_time', ''))
+    if key not in WEATHER_CACHE:
+        WEATHER_CACHE[key] = fetch_weather(g['home_abbv'], str(TODAY), g.get('game_time'))
 live_count = sum(1 for v in WEATHER_CACHE.values() if v[2] == 'api')
-print(f'  Fetched weather for {live_count}/{len(WEATHER_CACHE)} stadiums')
+print(f'  Fetched first-pitch weather for {live_count}/{len(WEATHER_CACHE)} games')
 
 # ── 4d. Odds (BettingPros) ────────────────────────────────────────────────────
 print('Fetching odds (The Odds API / Bovada fallback)...')
@@ -1273,7 +1398,7 @@ for g in games:
     away_ops, home_ops, away_ops_src, home_ops_src = fetch_game_ops(
         g['game_id'], away, home, g.get('away_id'), g.get('home_id'))
     park            = PARK_FACTORS.get(home, 100)
-    temp, rain, weather_src = WEATHER_CACHE.get(home, (65, 0, 'default'))
+    temp, rain, weather_src = WEATHER_CACHE.get((home, g.get('game_time', '')), (65, 0, 'default'))
 
     home_yrfi, home_yrfi_src = get_yrfi(home, yrfi_home, yrfi_home_prev, yrfi_overall)
     away_yrfi, away_yrfi_src = get_yrfi(away, yrfi_away, yrfi_away_prev, yrfi_overall)
