@@ -90,6 +90,22 @@ SEASON_START   = date(2026, 4, 15)   # first date counted in YTD stats — based
 AFTERNOON_CUTOFF_UTC_HOUR = 21
 MIN_COVERAGE       = 0.10
 MAX_COVERAGE       = 0.15
+# LR confidence band: percentile of recent LR outputs, BOUNDARY UNMOVED (2026-08-25) — tails are independent allocations (SUM = coverage target, SPLIT = directional tilt) so the YRFI lean survives a coverage fix; 30% at 3:1 tuned on a full-season 2026 walk-forward, CV margin sweep below is the small-pool fallback. See DECISIONS.md 2026-08-25 / 2026-08-26.
+LR_YRFI_TAIL       = 0.225  # fraction of pool above `high` -> YRFI picks
+LR_NRFI_TAIL       = 0.075  # fraction of pool below `low`  -> NRFI picks
+LR_POOL_DAYS       = 45
+LR_POOL_MIN        = 100
+# Hard floor: the 2026-08-14 corpus un-freeze shifted the LR output distribution, so pooling across it would size the band on a distribution the model no longer produces — set to None once the break is older than LR_POOL_DAYS.
+LR_POOL_NOT_BEFORE = date(2026, 8, 15)
+
+# ── Blend model (third pick set, 2026-08-26) ──────────────────────────────────
+# LR shrunk toward the de-vigged market consensus; which source is better flips mid-season, so the weight is set ADAPTIVELY from each one's trailing realised edge. See DECISIONS.md 2026-08-26.
+BLEND_ENABLED       = os.environ.get('NRFI_BLEND_ENABLED', '1') != '0'
+BLEND_LOOKBACK_DAYS = 60
+BLEND_MIN_GRADED    = 150
+BLEND_DEFAULT_W     = 0.50
+BLEND_W_MIN         = 0.20
+BLEND_W_MAX         = 0.90
 # NN confidence band is set by PERCENTILE of recent NN outputs (rolling window), not a fixed CV margin (2026-06-07). A margin tuned on historical CV undershot deployment coverage badly (2.8% vs 15% target) because the live output distribution is shifted/ compressed. Percentile calibration on a recent window hits the coverage target on the distribution actually being scored. See DECISIONS.md 2026-06-07.
 NN_COVERAGE_TARGET = 0.15   # fraction of games to flag confident (split across both tails)
 NN_POOL_DAYS       = 45     # rolling window of recent game_logs to calibrate the band
@@ -132,6 +148,9 @@ STADIUM_COORDS = {
     'TB':  (27.7683,  -82.6534), 'TEX': (32.7473,  -97.0845),
     'TOR': (43.6414,  -79.3894), 'WAS': (38.8730,  -77.0074),
 }
+
+# Climate-controlled parks: roof shut all season, so the boxscore reports a near-constant indoor temp and outdoor weather is the wrong variable — feeding it ran +16 to +36F wrong on `temp`, the LR's strongest feature. Values are the 2021-2025 boxscore means (sd 0.8-2.7F). TOR/MIL/SEA are deliberately excluded: their roofs track ambient (error <2F). See DECISIONS.md 2026-08-25.
+DOME_TEMPS = {'HOU': 73.0, 'TB': 72.0, 'MIA': 72.5, 'TEX': 74.0, 'ARI': 78.5}
 
 # teamrankings name → abbreviation
 TR_TO_ABBV = {
@@ -190,7 +209,11 @@ def load_data(path):
 # which pushed every August game's YRFI probability up and inflated LR coverage to 46%. Hourly
 # temperature at the game's local start hour is the like-for-like analogue of the boxscore value.
 def fetch_weather(abbv, target_date, first_pitch_utc=None):
-    """Return (temp_F, rain, source) for a team's home stadium at first pitch on target_date. `first_pitch_utc` is an ISO-8601 UTC string (statsapi `game_datetime`); when it is missing we fall back to 19:00 stadium-local, the modal MLB start. `rain` is precipitation over the 3h game window — kept for the game_log/DQ only, it is NOT a model feature (see FEATURES). source is 'api' on a live fetch, 'default' on any failure."""
+    """Return (temp_F, rain, source) for a team's home stadium at first pitch on target_date. `first_pitch_utc` is an ISO-8601 UTC string (statsapi `game_datetime`); when it is missing we fall back to 19:00 stadium-local, the modal MLB start. `rain` is precipitation over the 3h game window — kept for the game_log/DQ only, it is NOT a model feature (see FEATURES). source is 'api' on a live fetch, 'dome' for a climate-controlled park (see DOME_TEMPS — constant indoor temp, no API call), 'default' on any failure."""
+    # Roof closed all season -> indoor temp is a constant and outdoor weather is the wrong variable; return before the API call, rain is 0 by construction under a closed roof.
+    if abbv in DOME_TEMPS:
+        return DOME_TEMPS[abbv], 0, 'dome'
+
     coords = STADIUM_COORDS.get(abbv)
     if coords is None:
         return 65, 0, 'default'
@@ -502,15 +525,40 @@ def grade_yesterday():
         ), axis=1
     )
 
+    # blend_correct: absent in logs written before the blend rollout, so guard the column.
+    if 'blend_pred' in log_df.columns:
+        log_df['blend_correct'] = log_df.apply(
+            lambda r: (
+                None if pd.isna(r['actual_yrfi']) or pd.isna(r.get('blend_pred')) else
+                int(('YRFI' if r['actual_yrfi'] == 1 else 'NRFI') == r['blend_pred'])
+            ), axis=1
+        )
+    else:
+        log_df['blend_correct'] = None
+
+    # Persist the graded log back to its own key — missing until 2026-08-30, actuals were filled into log_df in memory then discarded, so game_log/ rows kept actual_yrfi = NaN forever and silently diverged from results.csv (1,062/2,019 graded vs 1,877), which is how the first P/L-repair dry-run reported a flattering 65.4% off a half-season; results.csv remains authoritative, this keeps game_log a faithful copy.
+    try:
+        _gbuf = io.BytesIO()
+        log_df.to_csv(_gbuf, index=False)
+        s3.put_object(Bucket=s3_bucket, Key=log_key,
+                      Body=_gbuf.getvalue(), ContentType='text/csv')
+        _ngraded = int(log_df['actual_yrfi'].notna().sum())
+        print(f'  Game log graded in place: {_ngraded}/{len(log_df)} rows -> {log_key}')
+    except Exception as _gex:
+        print(f'  WARNING: could not write graded game log back ({_gex})')
+
     # Print summary for confident picks
     print(f'\n{"=" * 60}')
     print(f'YESTERDAY\'S RESULTS — {ystr}')
     print(f'{"=" * 60}')
     lr_conf = log_df[log_df['lr_confident'] == True]
     nn_conf = log_df[log_df['nn_confident'] == True]
+    bl_conf = (log_df[log_df['blend_confident'] == True]
+               if 'blend_confident' in log_df.columns else log_df.iloc[0:0])
     for label, subset, pred_col, correct_col, conf_col in [
         ('LR', lr_conf, 'lr_pred', 'lr_correct', 'lr_conf'),
         ('NN', nn_conf, 'nn_pred', 'nn_correct', 'nn_conf'),
+        ('BLEND', bl_conf, 'blend_pred', 'blend_correct', 'blend_conf'),
     ]:
         if subset.empty:
             print(f'  [{label}] No confident picks')
@@ -529,7 +577,8 @@ def grade_yesterday():
             print(f'  [{char}][{label}] {r["matchup"]:14}  {r[pred_col]}  '
                   f'({r[conf_col]:.1%}){odds_str}  -> {status}')
 
-    for label, subset, correct_col in [('LR', lr_conf, 'lr_correct'), ('NN', nn_conf, 'nn_correct')]:
+    for label, subset, correct_col in [('LR', lr_conf, 'lr_correct'), ('NN', nn_conf, 'nn_correct'),
+                                       ('BLEND', bl_conf, 'blend_correct')]:
         graded = subset[subset[correct_col].notna()]
         if not graded.empty:
             w = int(graded[correct_col].sum())
@@ -832,8 +881,33 @@ def _save_nn_to_s3(model, s3_path):
     except Exception as ex:
         print(f'  WARNING: could not save NN to S3 ({ex})')
 
-def _recent_nn_pool(end_date, n_days):
-    """Pool `nn_prob_yrfi` from the last `n_days` of game_logs ending before `end_date`. Used to calibrate the NN confidence band by percentile on the live output distribution. The NN evolves slowly (boundary drifts ~3e-4/day under the L2-SP anchored incremental update), so stored outputs from recent days are a faithful proxy for the current model's distribution. Returns a 1-D np.array (possibly empty)."""
+def _nn_retrain_date_key(s3_path):
+    """Sidecar key next to the weights recording when the NN was last refit from scratch."""
+    bucket, key = s3_path[5:].split('/', 1)
+    return bucket, key.rsplit('.', 1)[0] + '.retrained_on'
+
+def _save_nn_retrain_date(s3_path, d):
+    import boto3
+    try:
+        bucket, key = _nn_retrain_date_key(s3_path)
+        boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=d.isoformat().encode())
+    except Exception as ex:
+        print(f'  WARNING: could not record NN retrain date ({ex})')
+
+def _load_nn_retrain_date(s3_path):
+    """Date of the last from-scratch refit, or None. Used to keep the band-calibration pool from reaching back past a model discontinuity."""
+    import boto3
+    try:
+        bucket, key = _nn_retrain_date_key(s3_path)
+        body = boto3.client('s3').get_object(Bucket=bucket, Key=key)['Body'].read()
+        return date.fromisoformat(body.decode().strip())
+    except Exception:
+        return None
+
+def _recent_pool(end_date, n_days, column, not_before=None):
+    """Pool `column` from the last `n_days` of game_logs ending before `end_date`. Used to calibrate a confidence band by percentile on the live output distribution, which is the only distribution the band is ever applied to. Returns a 1-D np.array (possibly empty).
+
+    `not_before` hard-floors the window at a known model discontinuity — a from-scratch refit (NN) or a training-corpus change (LR) is a break, not drift, and outputs written before it came from a model that no longer exists. Without the floor the band silently describes the dead model, which ran NN at 30% coverage against a 15% target for ten days after the 2026-08-14 refit."""
     bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
     if not bucket:
         return np.array([])
@@ -842,15 +916,20 @@ def _recent_nn_pool(end_date, n_days):
     probs = []
     for i in range(1, n_days + 1):
         d = end_date - timedelta(days=i)
+        if not_before is not None and d < not_before:
+            continue
         key = f'game_log/{d.year}/{d.isoformat()}.csv'
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             gl  = pd.read_csv(io.BytesIO(obj['Body'].read()))
-            if 'nn_prob_yrfi' in gl.columns:
-                probs.append(pd.to_numeric(gl['nn_prob_yrfi'], errors='coerce').dropna().values)
+            if column in gl.columns:
+                probs.append(pd.to_numeric(gl[column], errors='coerce').dropna().values)
         except Exception:
             continue
     return np.concatenate(probs) if probs else np.array([])
+
+def _recent_nn_pool(end_date, n_days, not_before=None):
+    return _recent_pool(end_date, n_days, 'nn_prob_yrfi', not_before=not_before)
 
 def _build_nn(input_dim):
     """8->8->8->1, lr=0.005, bs=64. Regularization dialed back to l2=1e-5, dropout=0 (2026-06-07): the prior l2=1e-3 on all three layers compressed the sigmoid output asymmetrically -- floor ~0.495, no left tail -- so the NN could NEVER produce a confident NRFI pick (0% below the NRFI band on train AND 2026 data). Light reg restores a symmetric ~25% NRFI tail (std~0.038) matching the LR. The kernel regularizer only affects the from-scratch fit; the incremental update applies its own L2-SP anchor in a custom loop, so this change is safe for daily stability."""
@@ -986,6 +1065,7 @@ else:
     print(f'  Trained from scratch on {len(y)} games')
     if uses_s3:
         _save_nn_to_s3(nn, NN_MODEL_PATH)
+        _save_nn_retrain_date(NN_MODEL_PATH, TODAY)
         print(f'  NN saved to {NN_MODEL_PATH}')
 
 # Calibrate the direction boundary from the production model's actual output distribution. LR matches y.mean() by construction; the NN's sigmoid outputs can sit systematically above or below the base rate. Pred direction and the agreement check both use this single boundary so a marginal NN output is classified consistently.
@@ -993,38 +1073,29 @@ nn_calibrated_boundary = float(nn.predict(X_nn_all, verbose=0).mean())
 nn_meta   = {'boundary': nn_calibrated_boundary}
 
 # NN confidence band: PERCENTILE of recent live outputs (rolling NN_POOL_DAYS window), targeting NN_COVERAGE_TARGET coverage on the distribution actually being scored. A fixed CV margin undershot deployment coverage badly (the live outputs are shifted/ compressed vs historical CV). If the rolling pool is too small (early season / no OUTPUT_BUCKET), fall back to a symmetric margin around the calibrated boundary.
-_nn_pool = _recent_nn_pool(TODAY, NN_POOL_DAYS)
+_nn_retrained_on = TODAY if _nn_from_scratch else (_load_nn_retrain_date(NN_MODEL_PATH) if uses_s3 else None)
+_nn_pool = _recent_nn_pool(TODAY, NN_POOL_DAYS, not_before=_nn_retrained_on)
 _tail    = NN_COVERAGE_TARGET / 2.0
+if _nn_retrained_on and not _nn_from_scratch:
+    _days_since = (TODAY - _nn_retrained_on).days
+    if _days_since < NN_POOL_DAYS:
+        print(f'  NN pool floored at the {_nn_retrained_on} refit ({_days_since}d of history '
+              f'available, not {NN_POOL_DAYS}) — pre-refit outputs came from a different model.')
 
-# A from-scratch refit produces a DIFFERENT output distribution than the model whose outputs are
-# sitting in the pool, so the pooled percentiles describe a model that no longer exists. Calibrate
-# off the new model's own outputs for this run instead. The live pool refills as new days land;
-# it stays mixed for up to NN_POOL_DAYS, which is self-correcting but worth knowing when reading
-# NN coverage in that window.
-if _nn_from_scratch and len(_nn_pool):
-    print(f'  NOTE: discarding {len(_nn_pool)} pooled outputs — they came from the previous '
-          f'model, which was just refit from scratch. Pool will be mixed for ≤{NN_POOL_DAYS}d.')
-    _nn_pool = np.array([])
-
-if _nn_from_scratch:
-    _self = nn.predict(X_nn_all, verbose=0).ravel()
-    nn_low  = round(float(np.percentile(_self, _tail * 100)), 4)
-    nn_high = round(float(np.percentile(_self, (1 - _tail) * 100)), 4)
-    print(f'NN band (percentile of the new model\'s own {len(_self)} training outputs):  '
-          f'<{nn_low} / >{nn_high}  (target {NN_COVERAGE_TARGET:.0%}, '
-          f'boundary {nn_calibrated_boundary:.4f})')
-elif len(_nn_pool) >= NN_POOL_MIN:
+if len(_nn_pool) >= NN_POOL_MIN:
     nn_low  = round(float(np.percentile(_nn_pool, _tail * 100)), 4)
     nn_high = round(float(np.percentile(_nn_pool, (1 - _tail) * 100)), 4)
     _cov_chk = float((_nn_pool < nn_low).mean() + (_nn_pool > nn_high).mean())
     print(f'NN band (percentile of {len(_nn_pool)} recent outputs):  <{nn_low} / >{nn_high}  '
           f'(cov {_cov_chk:.1%}, target {NN_COVERAGE_TARGET:.0%}, boundary {nn_calibrated_boundary:.4f})')
 else:
-    _fallback_margin = 0.045
-    nn_low  = round(nn_calibrated_boundary - _fallback_margin, 3)
-    nn_high = round(nn_calibrated_boundary + _fallback_margin, 3)
-    print(f'NN band (FALLBACK margin {_fallback_margin}; only {len(_nn_pool)} pooled '
-          f'outputs < {NN_POOL_MIN}):  <{nn_low} / >{nn_high}  boundary {nn_calibrated_boundary:.4f}')
+    # Too little post-refit live history — fall back to the model's OWN training-set percentiles rather than a fixed margin, since same model lands far closer to the live band.
+    _self = nn.predict(X_nn_all, verbose=0).ravel()
+    nn_low  = round(float(np.percentile(_self, _tail * 100)), 4)
+    nn_high = round(float(np.percentile(_self, (1 - _tail) * 100)), 4)
+    print(f'NN band (percentile of the model\'s own {len(_self)} training outputs; only '
+          f'{len(_nn_pool)} pooled live outputs < {NN_POOL_MIN}):  <{nn_low} / >{nn_high}  '
+          f'(target {NN_COVERAGE_TARGET:.0%}, boundary {nn_calibrated_boundary:.4f})')
 
 # ══════════════════════════════════════════════════════════════════════════════ PART 2 — CV THRESHOLD TUNING ══════════════════════════════════════════════════════════════════════════════
 kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -1054,17 +1125,31 @@ eligible  = [(mgn, a, n, c) for mgn, a, n, c in cv_rows if MIN_COVERAGE <= c <= 
 best      = max(eligible, key=lambda r: edge_score(r[1], r[3])) if eligible else None
 MARGIN    = best[0] if best else 0.045
 
-# One LR boundary everywhere: prediction direction, band center, agreement.
-LOW  = round(BOUNDARY - MARGIN, 3)
-HIGH = round(BOUNDARY + MARGIN, 3)
-
 if best:
-    print(f'LR CV band:  boundary {BOUNDARY:.4f} ± {MARGIN:.3f}  ->  <{LOW} / >{HIGH}  '
-          f'(acc={best[1]:.1%}, cov={best[3]:.1%}, edge={edge_score(best[1], best[3]):.4f})')
+    print(f'LR CV sweep: boundary {BOUNDARY:.4f} ± {MARGIN:.3f}  '
+          f'(acc={best[1]:.1%}, in-sample cov={best[3]:.1%}, edge={edge_score(best[1], best[3]):.4f})')
 else:
-    print(f'LR CV band:  boundary {BOUNDARY:.4f} ± {MARGIN:.3f}  ->  <{LOW} / >{HIGH}  (fallback)')
+    print(f'LR CV sweep: boundary {BOUNDARY:.4f} ± {MARGIN:.3f}  (fallback)')
+
+# The CV sweep measures coverage IN-SAMPLE, but the band is only ever applied to the LIVE output distribution, and the two diverged in both directions during 2026 (40% live coverage in July, 5% in August) — size the band on the live pool, keeping BOUNDARY put; the CV margin is the cold-pool fallback. See DECISIONS.md 2026-08-25.
+_lr_pool = _recent_pool(TODAY, LR_POOL_DAYS, 'lr_prob_yrfi', not_before=LR_POOL_NOT_BEFORE)
+if len(_lr_pool) >= LR_POOL_MIN:
+    LOW  = round(float(np.percentile(_lr_pool, LR_NRFI_TAIL * 100)), 4)
+    HIGH = round(float(np.percentile(_lr_pool, (1 - LR_YRFI_TAIL) * 100)), 4)
+    _lr_cov = float((_lr_pool < LOW).mean() + (_lr_pool > HIGH).mean())
+    print(f'LR band (percentile of {len(_lr_pool)} recent outputs):  <{LOW} / >{HIGH}  '
+          f'(cov {_lr_cov:.1%}, target {LR_YRFI_TAIL + LR_NRFI_TAIL:.0%} = '
+          f'{LR_YRFI_TAIL:.1%} YRFI / {LR_NRFI_TAIL:.1%} NRFI, boundary {BOUNDARY:.4f} unmoved)')
+else:
+    LOW  = round(BOUNDARY - MARGIN, 3)
+    HIGH = round(BOUNDARY + MARGIN, 3)
+    _lr_cov = None
+    print(f'LR band (FALLBACK to CV margin; only {len(_lr_pool)} pooled outputs < {LR_POOL_MIN}):  '
+          f'<{LOW} / >{HIGH}')
 cw_metric('LRBandMargin', MARGIN,                unit='None')
 cw_metric('LRCVAccuracy', best[1] if best else 0.0, unit='None')
+if _lr_cov is not None:
+    cw_metric('LRPoolCoverage', _lr_cov, unit='None')
 
 # ══════════════════════════════════════════════════════════════════════════════ PART 3 — FETCH TODAY'S GAMES ══════════════════════════════════════════════════════════════════════════════
 print(f'\nFetching schedule for {TODAY}...')
@@ -1368,7 +1453,9 @@ for g in games:
     if key not in WEATHER_CACHE:
         WEATHER_CACHE[key] = fetch_weather(g['home_abbv'], str(TODAY), g.get('game_time'))
 live_count = sum(1 for v in WEATHER_CACHE.values() if v[2] == 'api')
-print(f'  Fetched first-pitch weather for {live_count}/{len(WEATHER_CACHE)} games')
+dome_count = sum(1 for v in WEATHER_CACHE.values() if v[2] == 'dome')
+print(f'  Fetched first-pitch weather for {live_count}/{len(WEATHER_CACHE)} games '
+      f'({dome_count} climate-controlled, {len(WEATHER_CACHE) - live_count - dome_count} defaulted)')
 
 # ── 4d. Odds (BettingPros) ────────────────────────────────────────────────────
 print('Fetching odds (The Odds API / Bovada fallback)...')
@@ -1381,6 +1468,94 @@ else:
 
 def get_odds(matchup_key):
     return GAME_ODDS.get(matchup_key)  # None if not available
+
+def _implied(american):
+    """American odds -> implied probability (vig included)."""
+    a = float(american)
+    return 100.0 / (a + 100.0) if a > 0 else abs(a) / (abs(a) + 100.0)
+
+def _devig(nrfi_odds, yrfi_odds):
+    """Two-way de-vigged P(YRFI) from an American price pair; nan if either side is missing."""
+    if nrfi_odds is None or yrfi_odds is None:
+        return float('nan')
+    try:
+        n, y = _implied(nrfi_odds), _implied(yrfi_odds)
+    except Exception:
+        return float('nan')
+    return float(y / (y + n)) if (y + n) > 0 else float('nan')
+
+def _blend_weight_from_history():
+    """Market weight from each source's trailing realised edge (AUC - 0.5), over the last BLEND_LOOKBACK_DAYS of graded rows in results/results.csv that have both a stored lr_prob_yrfi and a priced market. A source decayed to chance contributes ~0 edge and is weighted down on its own — the LR earns its weight in April and loses it by August with no constant to edit. Returns (w, lr_auc, mkt_auc, n)."""
+    bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
+    if not bucket:
+        return BLEND_DEFAULT_W, None, None, 0
+    import boto3, io as _io
+    try:
+        obj = boto3.client('s3').get_object(Bucket=bucket, Key='results/results.csv')
+        h = pd.read_csv(_io.BytesIO(obj['Body'].read()))
+    except Exception:
+        return BLEND_DEFAULT_W, None, None, 0
+    try:
+        h['date'] = pd.to_datetime(h['date'], errors='coerce')
+        h = h[h['date'] >= pd.Timestamp(TODAY) - pd.Timedelta(days=BLEND_LOOKBACK_DAYS)]
+        h = h[h['actual_yrfi'].notna() & h['lr_prob_yrfi'].notna()
+              & h['nrfi_odds'].notna() & h['yrfi_odds'].notna()]
+        if len(h) < BLEND_MIN_GRADED:
+            return BLEND_DEFAULT_W, None, None, len(h)
+        mkt = np.array([_devig(n, y) for n, y in zip(h['nrfi_odds'], h['yrfi_odds'])])
+        lrp = pd.to_numeric(h['lr_prob_yrfi'], errors='coerce').values
+        act = pd.to_numeric(h['actual_yrfi'], errors='coerce').values
+        ok  = ~(np.isnan(mkt) | np.isnan(lrp) | np.isnan(act))
+        if ok.sum() < BLEND_MIN_GRADED or len(np.unique(act[ok])) < 2:
+            return BLEND_DEFAULT_W, None, None, int(ok.sum())
+        from sklearn.metrics import roc_auc_score
+        a_lr, a_mk = roc_auc_score(act[ok], lrp[ok]), roc_auc_score(act[ok], mkt[ok])
+        e_lr, e_mk = max(a_lr - 0.5, 1e-4), max(a_mk - 0.5, 1e-4)
+        w = min(max(e_mk / (e_lr + e_mk), BLEND_W_MIN), BLEND_W_MAX)
+        return float(w), float(a_lr), float(a_mk), int(ok.sum())
+    except Exception:
+        return BLEND_DEFAULT_W, None, None, 0
+
+def _recent_blend_pool(end_date, n_days, w, not_before=None):
+    """Reconstruct the blended-probability pool from recent game_logs. The blend isn't persisted historically, but every row carries lr_prob_yrfi and both prices, so it can be rebuilt at TODAY's weight — which is what the band must be calibrated on."""
+    bucket = os.environ.get('NRFI_OUTPUT_BUCKET')
+    if not bucket:
+        return np.array([])
+    import boto3, io as _io
+    s3 = boto3.client('s3')
+    out = []
+    for i in range(1, n_days + 1):
+        d = end_date - timedelta(days=i)
+        if not_before is not None and d < not_before:
+            continue
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f'game_log/{d.year}/{d.isoformat()}.csv')
+            gl  = pd.read_csv(_io.BytesIO(obj['Body'].read()))
+            if not {'lr_prob_yrfi', 'nrfi_odds', 'yrfi_odds'}.issubset(gl.columns):
+                continue
+            lrp = pd.to_numeric(gl['lr_prob_yrfi'], errors='coerce').values
+            mk  = np.array([_devig(n, y) for n, y in zip(gl['nrfi_odds'], gl['yrfi_odds'])])
+            bl  = np.where(np.isnan(mk), lrp, (1 - w) * lrp + w * mk)
+            out.append(bl[~np.isnan(bl)])
+        except Exception:
+            continue
+    return np.concatenate(out) if out else np.array([])
+
+# ── 4e. NRFI juice tracking ───────────────────────────────────────────────────
+# Books shade NRFI toward the public side, so the two sides do not carry symmetric vig — that asymmetry is the structural edge the YRFI-heavy tilt rides, so it is measured daily rather than assumed; `NrfiJuiceAsymmetry` = mean NRFI implied - mean YRFI implied in probability points, positive means NRFI is the pricier side — if it decays toward 0, revisit LR_NRFI_TAIL. See DECISIONS.md 2026-08-25.
+if using_real_odds:
+    _imp_n = [_implied(o[0]) for o in GAME_ODDS.values() if o and o[0] is not None]
+    _imp_y = [_implied(o[1]) for o in GAME_ODDS.values() if o and o[1] is not None]
+    if _imp_n and _imp_y:
+        _mn, _my = float(np.mean(_imp_n)), float(np.mean(_imp_y))
+        _vig     = _mn + _my - 1.0
+        _asym    = _mn - _my
+        print(f'  Juice: NRFI implied {_mn:.4f} / YRFI implied {_my:.4f}  '
+              f'(vig {_vig:+.2%}, NRFI dearer by {_asym * 100:+.2f}pp)')
+        cw_metric('NrfiImpliedProb',      _mn,   unit='None')
+        cw_metric('YrfiImpliedProb',      _my,   unit='None')
+        cw_metric('TwoWayVig',            _vig,  unit='None')
+        cw_metric('NrfiJuiceAsymmetry',   _asym, unit='None')
 
 # ══════════════════════════════════════════════════════════════════════════════ PART 5 — BUILD FEATURE ROWS FOR TODAY'S GAMES ══════════════════════════════════════════════════════════════════════════════
 print('\nBuilding feature rows...')
@@ -1544,8 +1719,50 @@ today_df['nn_confident'] = (nn_probs < nn_low) | (nn_probs > nn_high)
 _models_agree_direction = (lr_probs > BOUNDARY) == (nn_probs > nn_boundary_today)
 today_df['consensus']    = today_df['lr_confident'] & today_df['nn_confident'] & _models_agree_direction
 
+# ── BLEND — LR shrunk toward the de-vigged market, scored as its own pick set ──
+# Nothing is fit here — it is the LR with a market prior; its band is calibrated like the others (percentile of its own recent outputs, rebuilt at today's weight) and uses the same tail split, so its coverage and tilt are directly comparable to the LR's.
+blend_w, _b_lr_auc, _b_mk_auc, _b_n = (_blend_weight_from_history() if BLEND_ENABLED
+                                       else (0.0, None, None, 0))
+market_probs = np.array([_devig(*(get_odds(mu) or (None, None))) for mu in today_df['matchup']])
+blend_probs_today = np.where(np.isnan(market_probs), lr_probs,
+                             (1 - blend_w) * lr_probs + blend_w * market_probs)
+today_df['market_prob_yrfi'] = market_probs
+today_df['blend_prob_yrfi']  = blend_probs_today
+today_df['blend_prob_nrfi']  = 1 - blend_probs_today
+
+if BLEND_ENABLED:
+    if _b_lr_auc is not None:
+        print(f'\nBlend weight: {blend_w:.2f} on market  (trailing {BLEND_LOOKBACK_DAYS}d, n={_b_n}: '
+              f'LR AUC {_b_lr_auc:.4f}, market AUC {_b_mk_auc:.4f})')
+    else:
+        print(f'\nBlend weight: {blend_w:.2f} on market  (default — only {_b_n} graded rows '
+              f'< {BLEND_MIN_GRADED})')
+    _bl_pool = _recent_blend_pool(TODAY, LR_POOL_DAYS, blend_w, not_before=LR_POOL_NOT_BEFORE)
+    if len(_bl_pool) >= LR_POOL_MIN:
+        blend_low  = round(float(np.percentile(_bl_pool, LR_NRFI_TAIL * 100)), 4)
+        blend_high = round(float(np.percentile(_bl_pool, (1 - LR_YRFI_TAIL) * 100)), 4)
+        _bl_cov = float((_bl_pool < blend_low).mean() + (_bl_pool > blend_high).mean())
+        print(f'BLEND band (percentile of {len(_bl_pool)} rebuilt outputs):  '
+              f'<{blend_low} / >{blend_high}  (cov {_bl_cov:.1%})')
+    else:
+        blend_low, blend_high = LOW, HIGH
+        print(f'BLEND band (FALLBACK to LR band; only {len(_bl_pool)} pooled < {LR_POOL_MIN}):  '
+              f'<{blend_low} / >{blend_high}')
+    # The blend mixes an LR centered on BOUNDARY with a market centered on ~0.5, so its own centre moves with the weight — split it at the same mix rather than reusing BOUNDARY.
+    blend_boundary = (1 - blend_w) * BOUNDARY + blend_w * 0.5
+else:
+    blend_low, blend_high, blend_boundary = LOW, HIGH, BOUNDARY
+
+today_df['blend_pred']      = np.where(blend_probs_today > blend_boundary, 'YRFI', 'NRFI')
+today_df['blend_conf']      = np.where(blend_probs_today > blend_boundary,
+                                       blend_probs_today, 1 - blend_probs_today)
+today_df['blend_confident'] = (((blend_probs_today < blend_low) | (blend_probs_today > blend_high))
+                               & BLEND_ENABLED)
+
 cw_metric('LRPickCount',        int(today_df['lr_confident'].sum()))
 cw_metric('NNPickCount',        int(today_df['nn_confident'].sum()))
+cw_metric('BlendPickCount',     int(today_df['blend_confident'].sum()))
+cw_metric('BlendWeight',        blend_w, unit='None')
 cw_metric('ConsensusPickCount', int(today_df['consensus'].sum()))
 
 # EV — only when real odds available; computed for the prediction each model makes
@@ -1563,11 +1780,14 @@ def compute_ev(probs_yrfi, preds, matchup_series):
 
 today_df['lr_ev'] = compute_ev(lr_probs, today_df['lr_pred'], today_df['matchup'])
 today_df['nn_ev'] = compute_ev(nn_probs, today_df['nn_pred'], today_df['matchup'])
+today_df['blend_ev'] = compute_ev(blend_probs_today, today_df['blend_pred'], today_df['matchup'])
 
 # ══════════════════════════════════════════════════════════════════════════════ PART 7 — OUTPUT ══════════════════════════════════════════════════════════════════════════════
 odds_note = '' if using_real_odds else '  (no odds — EV unavailable)'
 header_note = (f'LR: <{LOW} / >{HIGH}  '
-               f'NN: <{nn_low} / >{nn_high}  [1u = ${UNIT}]{odds_note}')
+               f'NN: <{nn_low} / >{nn_high}  '
+               + (f'BLEND(w={blend_w:.2f}): <{blend_low} / >{blend_high}  ' if BLEND_ENABLED else '')
+               + f'[1u = ${UNIT}]{odds_note}')
 
 # ── All-games table ───────────────────────────────────────────────────────────
 print('\n' + '=' * 80)
@@ -1650,6 +1870,10 @@ nn_payload = print_picks_section(
     today_df['nn_confident'], 'NN',
     'nn_pred', 'nn_conf', 'nn_ev', 'nn_prob_nrfi', 'nn_prob_yrfi',
 )
+blend_payload = print_picks_section(
+    today_df['blend_confident'], 'BLEND',
+    'blend_pred', 'blend_conf', 'blend_ev', 'blend_prob_nrfi', 'blend_prob_yrfi',
+) if BLEND_ENABLED else []
 
 # Drop any NN pick that contradicts LR's direction for the same game. Without this, the email merges them into "NN,LR → YRFI" even when NN said NRFI.
 _lr_directions = {p['matchup']: p['prediction'] for p in lr_payload}
@@ -1702,6 +1926,19 @@ def save_game_log(df, date_str, lr_threshold_low, lr_threshold_high,
             'nn_threshold_low':   round(nn_threshold_low, 3),
             'nn_threshold_high':  round(nn_threshold_high, 3),
             'nn_boundary':        round(nn_boundary, 4),
+            # BLEND (LR shrunk toward the de-vigged market — third pick set, 2026-08-26)
+            'market_prob_yrfi':   (round(r['market_prob_yrfi'], 4)
+                                   if pd.notna(r.get('market_prob_yrfi')) else None),
+            'blend_prob_yrfi':    round(r['blend_prob_yrfi'], 4),
+            'blend_prob_nrfi':    round(r['blend_prob_nrfi'], 4),
+            'blend_pred':         r['blend_pred'],
+            'blend_conf':         round(r['blend_conf'], 4),
+            'blend_confident':    bool(r['blend_confident']),
+            'blend_ev':           r['blend_ev'],
+            'blend_threshold_low':  round(blend_low, 4),
+            'blend_threshold_high': round(blend_high, 4),
+            'blend_boundary':     round(blend_boundary, 4),
+            'blend_weight':       round(blend_w, 4),
             # Consensus
             'consensus':          bool(r['consensus']),
             # CV stats for this run
@@ -1737,6 +1974,7 @@ def save_game_log(df, date_str, lr_threshold_low, lr_threshold_high,
             'actual_yrfi':        None,
             'lr_correct':         None,
             'nn_correct':         None,
+            'blend_correct':      None,
         })
     import io
     log_df = pd.DataFrame(log_rows)

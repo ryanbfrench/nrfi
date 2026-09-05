@@ -1,5 +1,7 @@
 """Single source of truth for the NRFI model + pick-decision logic, imported by both daily_picks.py (live) and scripts/backfill_picks.py (repair) so they can't drift. Pure/offline only: feature prep, LR/NN training + bands, and the decision layer (prob -> pred/confidence/consensus/EV), which is separable from the probabilities so most pick bugs are fixable from stored probs with no retrain."""
 
+import datetime as _dt
+
 import numpy as np
 import pandas as pd
 
@@ -14,10 +16,59 @@ MIN_COVERAGE       = 0.10
 MAX_COVERAGE       = 0.15
 MARGIN_SWEEP       = np.round(np.arange(0.02, 0.131, 0.005), 3)
 
-# LR confidence band: percentile of recent live outputs, falling back to weighted boundary ± CV margin. See DECISIONS.md 2026-06-20 (the "only YRFI lately" fix).
-LR_COVERAGE_TARGET = 0.15
+# LR confidence band: percentile of recent live outputs, falling back to weighted boundary ± CV margin (DECISIONS.md 2026-06-20 "only YRFI lately", 2026-08-25 decoupling coverage from tilt, 2026-08-26 retuned on a full-season walk-forward) — COVERAGE and TILT are separate knobs: the tails are independent percentile allocations, so their SUM is the coverage target and their SPLIT is the directional lean; 30% at 3:1 YRFI:NRFI was tuned on the full 2026 season, the tilt rides books shading NRFI toward the public side.
+LR_YRFI_TAIL       = 0.225   # fraction of the pool above `high` -> YRFI picks
+LR_NRFI_TAIL       = 0.075   # fraction of the pool below `low`  -> NRFI picks
+LR_COVERAGE_TARGET = LR_YRFI_TAIL + LR_NRFI_TAIL
 LR_POOL_DAYS       = 45
 LR_POOL_MIN        = 100
+# Hard floor for the LR pool: the 2026-08-14 corpus un-freeze shifted the live output distribution, so pooling across it would size the band on a distribution the model no longer produces (same bug as the NN pool floor) — set to None once the break is older than LR_POOL_DAYS.
+LR_POOL_NOT_BEFORE = _dt.date(2026, 8, 15)
+
+# ── Blend model (LR shrunk toward the market) — the third pick set ─────────────
+# Added 2026-08-26. Which source is better flips mid-season — the de-vigged market out-predicts the LR in H2 2026 and a logit stack gives the LR a negative coefficient there, while H1 reverses — so no fixed weight is right all season and the weight is set from each source's TRAILING realised edge; a fixed w=0.50 scored slightly higher on the season but is a spiky grid argmax. See DECISIONS.md 2026-08-26.
+BLEND_LOOKBACK_DAYS = 60     # trailing graded window used to size the weight
+BLEND_MIN_GRADED    = 150    # below this, fall back to BLEND_DEFAULT_W
+BLEND_DEFAULT_W     = 0.50
+BLEND_W_MIN         = 0.20   # never fully ignore the market...
+BLEND_W_MAX         = 0.90   # ...and never fully ignore the model
+
+def devig_market_prob(nrfi_odds, yrfi_odds):
+    """Two-way de-vigged P(YRFI) implied by a NRFI/YRFI American price pair; np.nan when either side is missing. Normalising by the two implied probabilities strips the ~3.8% vig, which is what makes the number comparable to a model probability."""
+    def _imp(a):
+        if a is None or (isinstance(a, float) and np.isnan(a)):
+            return np.nan
+        a = float(a)
+        return 100.0 / (a + 100.0) if a > 0 else abs(a) / (abs(a) + 100.0)
+    n, y = _imp(nrfi_odds), _imp(yrfi_odds)
+    if np.isnan(n) or np.isnan(y) or (n + y) <= 0:
+        return np.nan
+    return float(y / (y + n))
+
+def blend_weight(model_probs, market_probs, actuals, *, min_graded=BLEND_MIN_GRADED,
+                 default_w=BLEND_DEFAULT_W, w_min=BLEND_W_MIN, w_max=BLEND_W_MAX):
+    """Weight to put on the MARKET, from each source's share of trailing realised edge: edge = AUC - 0.5 over the graded window, w = market_edge / (model_edge + market_edge) clipped to [w_min, w_max]. A source decayed to chance contributes ~0 edge and is weighted down on its own. Returns (w, model_auc, market_auc, n) — the AUCs let the caller log WHY the weight moved."""
+    m = np.asarray(model_probs, dtype=float)
+    k = np.asarray(market_probs, dtype=float)
+    a = np.asarray(actuals, dtype=float)
+    ok = ~(np.isnan(m) | np.isnan(k) | np.isnan(a))
+    m, k, a = m[ok], k[ok], a[ok]
+    if len(a) < min_graded or len(np.unique(a)) < 2:
+        return default_w, None, None, len(a)
+    from sklearn.metrics import roc_auc_score
+    try:
+        am, ak = roc_auc_score(a, m), roc_auc_score(a, k)
+    except Exception:
+        return default_w, None, None, len(a)
+    em, ek = max(am - 0.5, 1e-4), max(ak - 0.5, 1e-4)
+    return float(min(max(ek / (em + ek), w_min), w_max)), float(am), float(ak), len(a)
+
+def blend_probs(model_probs, market_probs, w):
+    """(1-w)*model + w*market, falling back to the model alone where no price exists."""
+    m = np.asarray(model_probs, dtype=float)
+    k = np.asarray(market_probs, dtype=float)
+    return np.where(np.isnan(k), m, (1.0 - w) * m + w * k)
+
 
 # NN confidence band: percentile of recent live outputs. See DECISIONS.md 2026-06-07.
 NN_COVERAGE_TARGET = 0.15
@@ -162,19 +213,19 @@ def lr_cv_margin(X_raw, y, sample_weights, *, sweep=MARGIN_SWEEP,
     margin = best[0] if best else 0.045
     return float(margin), (best[1] if best else 0.0), (best[3] if best else 0.0), cv_boundary
 
-def lr_band(boundary, margin, lr_pool, *, coverage_target=LR_COVERAGE_TARGET,
-            pool_min=LR_POOL_MIN):
-    """Recenter the LR boundary + band on the LIVE output distribution (the YRFI-only fix). When ≥ pool_min recent live `lr_prob_yrfi` are pooled, override: boundary = pool median, low/high = P(tail)/P(1-tail) at coverage_target. Otherwise fall back to the static weighted boundary ± CV margin. Returns dict(boundary, low, high, regime, coverage, n_pool). Mirrors daily_picks PART 2."""
+def lr_band(boundary, margin, lr_pool, *, yrfi_tail=LR_YRFI_TAIL, nrfi_tail=LR_NRFI_TAIL,
+            pool_min=LR_POOL_MIN, recenter=False):
+    """Size the LR band on the LIVE output distribution so coverage lands on target, WITHOUT moving the decision boundary — the two are separate knobs (2026-08-25): `yrfi_tail`/`nrfi_tail` are independent percentile allocations, so the total is the coverage target and the split is the directional tilt (symmetric is neutral, a YRFI-heavy split reproduces the historical lean), while `recenter` also moves the boundary to the pool median and is OFF by default since that's the piece the 2026-06-21 revert rejected (recentering kills the YRFI lean, which is riding a real market mispricing). Coverage is exact ON THE POOL; live coverage drifts a little because today's games aren't the trailing window. Falls back to the static boundary ± CV margin when the pool is too small. Returns dict(boundary, low, high, regime, coverage, n_pool)."""
     pool = np.asarray(lr_pool, dtype=float)
     pool = pool[~np.isnan(pool)]
-    tail = coverage_target / 2.0
     if len(pool) >= pool_min:
-        b   = float(np.median(pool))
-        low  = round(float(np.percentile(pool, tail * 100)), 4)
-        high = round(float(np.percentile(pool, (1 - tail) * 100)), 4)
+        b    = float(np.median(pool)) if recenter else float(boundary)
+        low  = round(float(np.percentile(pool, nrfi_tail * 100)), 4) if nrfi_tail > 0 else float('-inf')
+        high = round(float(np.percentile(pool, (1 - yrfi_tail) * 100)), 4) if yrfi_tail > 0 else float('inf')
         cov  = float((pool < low).mean() + (pool > high).mean())
         return {'boundary': b, 'low': low, 'high': high,
-                'regime': 'percentile', 'coverage': cov, 'n_pool': len(pool)}
+                'regime': 'percentile' + ('+recentered' if recenter else ''),
+                'coverage': cov, 'n_pool': len(pool)}
     return {'boundary': float(boundary),
             'low':  round(boundary - margin, 3),
             'high': round(boundary + margin, 3),
